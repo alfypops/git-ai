@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::internal_db::InternalDatabase;
 use crate::authorship::range_authorship;
@@ -850,9 +851,13 @@ pub(crate) fn handle_push_authorship_notes_internal(args: &[String]) {
     disable_debug_logs_for_machine_command();
     let (repo, request) = parse_authorship_remote_request(args, "push-authorship-notes");
 
-    push_authorship_notes(&repo, &request.remote_name).unwrap_or_else(|e| {
+    let decision = push_authorship_notes(&repo, &request.remote_name).unwrap_or_else(|e| {
         emit_machine_json_error(format!("push_authorship_notes failed: {}", e))
     });
+
+    if let crate::git::sync_authorship::NotesPushDecision::Skipped(reason) = decision {
+        eprintln!("skipped: {}", reason);
+    }
 
     let response = PushAuthorshipNotesResponse { ok: true };
     let response_value = serde_json::to_value(response).unwrap_or_else(|e| {

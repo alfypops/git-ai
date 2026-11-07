@@ -1,15 +1,20 @@
+// Modified by alfypops, 2026: families outside daemon_repo_roots are ignored too.
 //! Repositories the untraced-commit fixup leaves alone. AI agents create
 //! scratch repositories under the OS temp directory for their own work; the
-//! fixup must not remember, scan, persist or backfill them. This is scoped to
-//! the fixup worker and its repo-family store only: traced commands and
-//! checkpoints in such repositories keep their normal behaviour, and nothing
-//! outside the fixup consults this.
+//! fixup must not remember, scan, persist or backfill them. The temp roots and
+//! `untraced_fixup_ignored_paths` globs are scoped to the fixup worker and its
+//! repo-family store: traced commands and checkpoints in such repositories keep
+//! their normal behaviour. `daemon_repo_roots` is the exception: it is
+//! daemon-wide (the trace and checkpoint gates apply it too), and here it
+//! makes the fixup leave families outside the list alone as well.
 
-use crate::config::Config;
+use crate::config::{Config, DaemonRepoRoots};
 use glob::Pattern;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-/// Where temporary repositories live, plus operator-configured path globs.
+/// Where temporary repositories live, operator-configured path globs, and the
+/// current `daemon_repo_roots`.
 #[derive(Debug, Clone, Default)]
 pub struct UntracedFixupIgnore {
     /// Canonical temp roots; a family whose common dir is under one is ignored.
@@ -17,6 +22,9 @@ pub struct UntracedFixupIgnore {
     /// `untraced_fixup_ignored_paths` globs, matched against the POSIX form of
     /// the family's canonical common dir.
     patterns: Vec<Pattern>,
+    /// `daemon_repo_roots`: with a non-empty list, families outside it are
+    /// ignored like everything else the daemon ignores.
+    repo_roots: Arc<DaemonRepoRoots>,
 }
 
 impl UntracedFixupIgnore {
@@ -41,13 +49,33 @@ impl UntracedFixupIgnore {
         Self {
             temp_roots: roots,
             patterns,
+            repo_roots: Arc::default(),
         }
+    }
+
+    pub fn with_repo_roots(mut self, repo_roots: Arc<DaemonRepoRoots>) -> Self {
+        self.repo_roots = repo_roots;
+        self
     }
 
     /// Whether the fixup must leave this family (a canonical common dir) alone.
     /// A component-wise prefix test per root and a glob match per pattern; no
     /// filesystem access.
     pub fn ignores(&self, common_dir: &str) -> bool {
+        !self.repo_roots.allows(Path::new(common_dir)) || self.ignores_by_path(common_dir)
+    }
+
+    /// Whether maintenance may forget this family's stored rows. A list that
+    /// fails closed without naming any root (an invalid value) only pauses the
+    /// fixup: forgetting every family then would lose their cursors for good.
+    pub fn forgets(&self, common_dir: &str) -> bool {
+        if self.repo_roots.is_active() && !self.repo_roots.has_entries() {
+            return self.ignores_by_path(common_dir);
+        }
+        self.ignores(common_dir)
+    }
+
+    fn ignores_by_path(&self, common_dir: &str) -> bool {
         let path = Path::new(common_dir);
         if self.temp_roots.iter().any(|root| path.starts_with(root)) {
             return true;
@@ -117,6 +145,58 @@ mod tests {
             "prefix matching is by path component, not by string"
         );
         assert!(!ignore.ignores(&canonical(&sibling)));
+    }
+
+    #[test]
+    fn families_outside_daemon_repo_roots_are_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let listed = temp.path().join("listed").join(".git");
+        let unlisted = temp.path().join("unlisted").join(".git");
+        for dir in [&listed, &unlisted] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let (roots, _) = crate::config::parse_daemon_repo_roots(Some(&serde_json::json!([temp
+            .path()
+            .join("listed")])));
+        let ignore = UntracedFixupIgnore::new(Vec::new(), Vec::new());
+        assert!(!ignore.ignores(&canonical(&unlisted)), "no list: tracked");
+
+        let ignore = ignore.with_repo_roots(Arc::new(roots));
+        assert!(!ignore.ignores(&canonical(&listed)));
+        assert!(ignore.ignores(&canonical(&unlisted)));
+    }
+
+    #[test]
+    fn maintenance_forgets_unlisted_families_only_when_the_list_names_a_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch_root = temp.path().join("tmp");
+        let scratch = scratch_root.join("scratch").join(".git");
+        let listed = temp.path().join("listed").join(".git");
+        let unlisted = temp.path().join("unlisted").join(".git");
+        for dir in [&scratch, &listed, &unlisted] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let base = UntracedFixupIgnore::new(vec![scratch_root], Vec::new());
+        let with_list = |value: serde_json::Value| {
+            let (roots, _) = crate::config::parse_daemon_repo_roots(Some(&value));
+            base.clone().with_repo_roots(Arc::new(roots))
+        };
+
+        let valid = with_list(serde_json::json!([temp.path().join("listed")]));
+        assert!(valid.forgets(&canonical(&unlisted)));
+        assert!(!valid.forgets(&canonical(&listed)));
+
+        // An invalid value fails closed (nothing is scanned) but names no
+        // root, so maintenance keeps every family's rows.
+        let fail_closed = with_list(serde_json::json!("not-a-list"));
+        assert!(fail_closed.ignores(&canonical(&listed)));
+        assert!(fail_closed.ignores(&canonical(&unlisted)));
+        assert!(!fail_closed.forgets(&canonical(&listed)));
+        assert!(!fail_closed.forgets(&canonical(&unlisted)));
+        assert!(
+            fail_closed.forgets(&canonical(&scratch)),
+            "path rules still forget scratch repos"
+        );
     }
 
     #[test]

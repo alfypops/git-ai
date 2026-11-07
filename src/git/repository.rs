@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::config;
 use crate::error::GitAiError;
 use crate::git::repo_state::{
@@ -5,7 +6,7 @@ use crate::git::repo_state::{
 };
 use crate::git::repo_storage::RepoStorage;
 use crate::git::status::MAX_PATHSPEC_ARGS;
-use crate::git::sync_authorship::push_authorship_notes;
+use crate::git::sync_authorship::{NotesPushDecision, push_authorship_notes};
 #[cfg(windows)]
 use crate::utils::is_interactive_terminal;
 use unicode_normalization::UnicodeNormalization;
@@ -1493,7 +1494,7 @@ impl Repository {
     }
 
     #[allow(dead_code)]
-    pub fn push_authorship(&self, remote_name: &str) -> Result<(), GitAiError> {
+    pub fn push_authorship(&self, remote_name: &str) -> Result<NotesPushDecision, GitAiError> {
         push_authorship_notes(self, remote_name)
     }
 

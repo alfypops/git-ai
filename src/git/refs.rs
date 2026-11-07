@@ -7,23 +7,45 @@ use crate::git::repository::{
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::OnceLock;
 
-// Modern refspecs without force to enable proper merging
+// Modified by alfypops, 2026: central authorship notes namespace.
+// Legacy public defaults retained for embedding consumers; operations use the accessor.
 pub const AI_AUTHORSHIP_REFNAME: &str = "ai";
 pub const AI_AUTHORSHIP_FULL_REF: &str = "refs/notes/ai";
 pub const AI_AUTHORSHIP_FORK_TRACKING_REF: &str = "refs/notes/ai-remote/fork";
 pub const AI_AUTHORSHIP_PUSH_REFSPEC: &str = "refs/notes/ai:refs/notes/ai";
+#[derive(Clone, Debug)]
+pub struct AuthorshipNotesRef {
+    pub name: String,
+    pub full: String,
+}
 
-pub(in crate::git) fn notes_add(
-    repo: &Repository,
-    commit_sha: &str,
-    note_content: &str,
-) -> Result<(), GitAiError> {
-    // Route through notes_add_batch to ensure consistent fanout tree format.
-    // Using git's native `notes add` can produce flat entries for small trees,
-    // leading to mixed-fanout trees that trigger assertion failures in
-    // `git notes merge` (notes-merge.c diff_tree_remote).
-    notes_add_batch(repo, &[(commit_sha.to_string(), note_content.to_string())])
+impl AuthorshipNotesRef {
+    pub fn tracking(&self, remote: &str) -> String {
+        format!("{}-remote/{}", self.full, sanitize_remote_name(remote))
+    }
+
+    pub fn push_refspec(&self) -> String {
+        format!("{}:{}", self.full, self.full)
+    }
+
+    pub fn display(&self) -> String {
+        format!("{}-display", self.full)
+    }
+}
+
+pub fn authorship_notes_ref() -> Result<AuthorshipNotesRef, GitAiError> {
+    static NOTES_REF: OnceLock<Result<AuthorshipNotesRef, String>> = OnceLock::new();
+    NOTES_REF
+        .get_or_init(|| {
+            crate::config::Config::load_notes_ref_checked().map(|name| AuthorshipNotesRef {
+                full: format!("refs/notes/{}", name),
+                name,
+            })
+        })
+        .clone()
+        .map_err(GitAiError::Generic)
 }
 
 #[doc(hidden)]
@@ -102,13 +124,19 @@ fn dedupe_note_entries(entries: &[(String, String)]) -> Vec<&(String, String)> {
 }
 
 #[doc(hidden)]
-pub fn flat_note_pathspec_for_commit(commit_sha: &str) -> String {
-    flat_note_pathspec_for_ref(AI_AUTHORSHIP_FULL_REF, commit_sha)
+pub fn flat_note_pathspec_for_commit(commit_sha: &str) -> Result<String, GitAiError> {
+    Ok(flat_note_pathspec_for_ref(
+        &authorship_notes_ref()?.full,
+        commit_sha,
+    ))
 }
 
 #[doc(hidden)]
-pub fn fanout_note_pathspec_for_commit(commit_sha: &str) -> String {
-    fanout_note_pathspec_for_ref(AI_AUTHORSHIP_FULL_REF, commit_sha)
+pub fn fanout_note_pathspec_for_commit(commit_sha: &str) -> Result<String, GitAiError> {
+    Ok(fanout_note_pathspec_for_ref(
+        &authorship_notes_ref()?.full,
+        commit_sha,
+    ))
 }
 
 #[doc(hidden)]
@@ -224,22 +252,23 @@ pub(in crate::git) fn note_blob_oids_for_commits(
     repo: &Repository,
     commit_shas: &[String],
 ) -> Result<HashMap<String, String>, GitAiError> {
-    note_blob_oids_for_commits_from_ref(repo, AI_AUTHORSHIP_FULL_REF, commit_shas)
+    note_blob_oids_for_commits_from_ref(repo, &authorship_notes_ref()?.full, commit_shas)
 }
 
 /// Read authorship note contents for a set of commits in batch.
 ///
 /// Returns a map of commit SHA -> raw note content for commits that currently
-/// have notes in `refs/notes/ai`.
-pub(in crate::git) fn notes_for_commits(
+/// have notes in the configured authorship ref.
+pub(in crate::git) fn notes_for_commits_from_ref(
     repo: &Repository,
     commit_shas: &[String],
+    notes_ref: &AuthorshipNotesRef,
 ) -> Result<HashMap<String, String>, GitAiError> {
     if commit_shas.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let note_blob_oids = note_blob_oids_for_commits(repo, commit_shas)?;
+    let note_blob_oids = note_blob_oids_for_commits_from_ref(repo, &notes_ref.full, commit_shas)?;
     if note_blob_oids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -265,7 +294,7 @@ pub(in crate::git) fn notes_for_commits(
 /// Resolve authorship note blob OIDs for a set of commits from a specific notes ref.
 ///
 /// Returns a map of commit SHA -> note blob SHA for commits that have notes on
-/// `notes_ref`. The destination `refs/notes/ai` is not consulted.
+/// `notes_ref`. The destination the configured authorship ref is not consulted.
 pub fn note_blob_oids_for_commits_from_ref(
     repo: &Repository,
     notes_ref: &str,
@@ -410,7 +439,7 @@ fn parse_ls_tree_note_entries(data: &[u8]) -> Result<Vec<LsTreeNoteEntry>, GitAi
     Ok(entries)
 }
 
-/// Copy missing notes for a bounded commit set from `source_ref` into `refs/notes/ai`.
+/// Copy missing notes for a bounded commit set from `source_ref` into the configured authorship ref.
 ///
 /// This deliberately does not merge `source_ref` wholesale. The source ref may
 /// contain untrusted notes from a fork, so callers must pass the exact commits
@@ -422,6 +451,20 @@ pub fn copy_missing_notes_for_commits_from_ref(
     source_ref: &str,
     commit_shas: &[String],
 ) -> Result<usize, GitAiError> {
+    copy_missing_notes_for_commits_from_ref_into(
+        repo,
+        source_ref,
+        commit_shas,
+        &authorship_notes_ref()?,
+    )
+}
+
+pub(crate) fn copy_missing_notes_for_commits_from_ref_into(
+    repo: &Repository,
+    source_ref: &str,
+    commit_shas: &[String],
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<usize, GitAiError> {
     if commit_shas.is_empty() || !ref_exists(repo, source_ref) {
         return Ok(0);
     }
@@ -431,7 +474,7 @@ pub fn copy_missing_notes_for_commits_from_ref(
         return Ok(0);
     }
 
-    let local_note_oids = note_blob_oids_for_commits(repo, commit_shas)?;
+    let local_note_oids = note_blob_oids_for_commits_from_ref(repo, &notes_ref.full, commit_shas)?;
     let entries: Vec<(String, String)> = commit_shas
         .iter()
         .filter(|commit_sha| !local_note_oids.contains_key(*commit_sha))
@@ -443,12 +486,12 @@ pub fn copy_missing_notes_for_commits_from_ref(
         .collect();
 
     let copied = entries.len();
-    notes_add_blob_batch(repo, &entries)?;
+    notes_add_blob_batch_to_ref(repo, &entries, notes_ref)?;
     Ok(copied)
 }
 
 /// Write a batch of authorship notes directly to the git-notes backend
-/// (`refs/notes/ai`), bypassing `crate::git::notes_api`'s backend routing.
+/// (the configured authorship ref), bypassing `crate::git::notes_api`'s backend routing.
 ///
 /// For external crates that embed this library and operate on repositories
 /// they manage themselves: they need a deterministic write that cannot be
@@ -466,6 +509,15 @@ pub(in crate::git) fn notes_add_batch(
     repo: &Repository,
     entries: &[(String, String)],
 ) -> Result<(), GitAiError> {
+    let notes_ref = authorship_notes_ref()?;
+    notes_add_batch_to_ref(repo, entries, &notes_ref)
+}
+
+pub(in crate::git) fn notes_add_batch_to_ref(
+    repo: &Repository,
+    entries: &[(String, String)],
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<(), GitAiError> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -473,7 +525,7 @@ pub(in crate::git) fn notes_add_batch(
     let mut args = repo.global_args_for_exec();
     args.push("rev-parse".to_string());
     args.push("--verify".to_string());
-    args.push("refs/notes/ai".to_string());
+    args.push(notes_ref.full.clone());
     let existing_notes_tip = match exec_git(&args) {
         Ok(output) => Some(String::from_utf8(output.stdout)?.trim().to_string()),
         Err(GitAiError::GitCliError {
@@ -503,7 +555,7 @@ pub(in crate::git) fn notes_add_batch(
             writer.write_all(b"\n")?;
         }
 
-        writer.write_all(b"commit refs/notes/ai\n")?;
+        writeln!(writer, "commit {}", notes_ref.full)?;
         writeln!(writer, "committer git-ai <git-ai@local> {} +0000", now)?;
         writer.write_all(b"data 0\n")?;
         if let Some(existing_tip) = existing_notes_tip.as_deref() {
@@ -537,6 +589,14 @@ pub(in crate::git) fn notes_add_blob_batch(
     repo: &Repository,
     entries: &[(String, String)],
 ) -> Result<(), GitAiError> {
+    notes_add_blob_batch_to_ref(repo, entries, &authorship_notes_ref()?)
+}
+
+fn notes_add_blob_batch_to_ref(
+    repo: &Repository,
+    entries: &[(String, String)],
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<(), GitAiError> {
     if entries.is_empty() {
         return Ok(());
     }
@@ -544,7 +604,7 @@ pub(in crate::git) fn notes_add_blob_batch(
     let mut args = repo.global_args_for_exec();
     args.push("rev-parse".to_string());
     args.push("--verify".to_string());
-    args.push("refs/notes/ai".to_string());
+    args.push(notes_ref.full.clone());
     let existing_notes_tip = match exec_git(&args) {
         Ok(output) => Some(String::from_utf8(output.stdout)?.trim().to_string()),
         Err(GitAiError::GitCliError {
@@ -565,7 +625,7 @@ pub(in crate::git) fn notes_add_blob_batch(
     fast_import_args.push("fast-import".to_string());
     fast_import_args.push("--quiet".to_string());
     exec_git_with_stdin_writer(&fast_import_args, |writer| {
-        writer.write_all(b"commit refs/notes/ai\n")?;
+        writeln!(writer, "commit {}", notes_ref.full)?;
         writeln!(writer, "committer git-ai <git-ai@local> {} +0000", now)?;
         writer.write_all(b"data 0\n")?;
         if let Some(existing_tip) = existing_notes_tip.as_deref() {
@@ -722,9 +782,17 @@ pub(in crate::git) fn get_commits_with_notes_from_list(
 
 // Show an authorship note and return its JSON content if found, or None if it doesn't exist.
 pub(in crate::git) fn show_authorship_note(repo: &Repository, commit_sha: &str) -> Option<String> {
+    show_authorship_note_from_ref(repo, commit_sha, &authorship_notes_ref().ok()?)
+}
+
+fn show_authorship_note_from_ref(
+    repo: &Repository,
+    commit_sha: &str,
+    notes_ref: &AuthorshipNotesRef,
+) -> Option<String> {
     let mut args = repo.global_args_for_exec();
     args.push("notes".to_string());
-    args.push("--ref=ai".to_string());
+    args.push(format!("--ref={}", notes_ref.name));
     args.push("show".to_string());
     args.push(commit_sha.to_string());
 
@@ -740,7 +808,7 @@ pub(in crate::git) fn show_authorship_note(repo: &Repository, commit_sha: &str) 
 
 /// Return the subset of `commit_shas` that currently has an authorship note.
 ///
-/// This uses a single `git notes --ref=ai list` invocation instead of one
+/// This uses a single `git notes --ref=<notes-ref> list` invocation instead of one
 /// `git notes show` call per commit.
 pub(in crate::git) fn commits_with_authorship_notes(
     repo: &Repository,
@@ -771,11 +839,12 @@ pub fn get_reference_as_working_log(
     Ok(working_log)
 }
 
-pub(in crate::git) fn get_reference_as_authorship_log_v3(
+pub(in crate::git) fn get_reference_as_authorship_log_v3_from_ref(
     repo: &Repository,
     commit_sha: &str,
+    notes_ref: &AuthorshipNotesRef,
 ) -> Result<AuthorshipLog, GitAiError> {
-    let content = show_authorship_note(repo, commit_sha)
+    let content = show_authorship_note_from_ref(repo, commit_sha, notes_ref)
         .ok_or_else(|| GitAiError::Generic("No authorship note found".to_string()))?;
 
     // Try to deserialize as AuthorshipLog
@@ -819,16 +888,16 @@ pub fn sanitize_remote_name(remote: &str) -> String {
 }
 
 /// Generate a tracking ref name for notes from a specific remote
-/// Returns a ref like "refs/notes/ai-remote/origin"
+/// Returns a ref like `refs/notes/<notes-ref>-remote/<remote>`
 ///
-/// SAFETY: These tracking refs are stored under refs/notes/ai-remote/* which:
+/// SAFETY: These tracking refs are stored under the configured tracking namespace which:
 /// - Won't be pushed by `git push` (only pushes refs/heads/* by default)
 /// - Won't be pushed by `git push --all` (only pushes refs/heads/*)
 /// - Won't be pushed by `git push --tags` (only pushes refs/tags/*)
 /// - **WILL** be pushed by `git push --mirror` (usually only used for backups, etc.)
-/// - **WILL** be pushed if user explicitly specifies refs/notes/ai-remote/* (extremely rare)
-pub fn tracking_ref_for_remote(remote_name: &str) -> String {
-    format!("refs/notes/ai-remote/{}", sanitize_remote_name(remote_name))
+/// - **WILL** be pushed if user explicitly specifies the configured tracking namespace (extremely rare)
+pub fn tracking_ref_for_remote(remote_name: &str) -> Result<String, GitAiError> {
+    Ok(authorship_notes_ref()?.tracking(remote_name))
 }
 
 /// Check if a ref exists in the repository
@@ -842,19 +911,27 @@ pub fn ref_exists(repo: &Repository, ref_name: &str) -> bool {
     exec_git(&args).is_ok()
 }
 
-/// Merge notes from a source ref into refs/notes/ai
+/// Merge notes from a source ref into the configured authorship ref
 /// Uses the 'ours' strategy to combine notes without data loss
 pub fn merge_notes_from_ref(repo: &Repository, source_ref: &str) -> Result<(), GitAiError> {
+    merge_notes_from_ref_into(repo, source_ref, &authorship_notes_ref()?)
+}
+
+pub(crate) fn merge_notes_from_ref_into(
+    repo: &Repository,
+    source_ref: &str,
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<(), GitAiError> {
     let mut args = repo.global_args_for_exec();
     args.push("notes".to_string());
-    args.push(format!("--ref={}", AI_AUTHORSHIP_REFNAME));
+    args.push(format!("--ref={}", notes_ref.name));
     args.push("merge".to_string());
     args.push("-s".to_string());
     args.push("ours".to_string());
     args.push("--quiet".to_string());
     args.push(source_ref.to_string());
 
-    tracing::debug!("Merging notes from {} into refs/notes/ai", source_ref);
+    tracing::debug!("Merging notes from {} into {}", source_ref, notes_ref.full);
     exec_git(&args)?;
     Ok(())
 }
@@ -870,14 +947,22 @@ pub fn merge_notes_from_ref(repo: &Repository, source_ref: &str) -> Result<(), G
 /// This is O(1) git process invocations regardless of note count, which matters on
 /// large monorepos with thousands of notes.
 pub fn fallback_merge_notes_ours(repo: &Repository, source_ref: &str) -> Result<(), GitAiError> {
-    let local_ref = format!("refs/notes/{}", AI_AUTHORSHIP_REFNAME);
+    fallback_merge_notes_ours_into(repo, source_ref, &authorship_notes_ref()?)
+}
+
+pub(crate) fn fallback_merge_notes_ours_into(
+    repo: &Repository,
+    source_ref: &str,
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<(), GitAiError> {
+    let local_ref = &notes_ref.full;
 
     // 1. List notes from both refs
     let source_notes = list_all_notes(repo, source_ref)?;
-    let local_notes = list_all_notes(repo, &local_ref)?;
+    let local_notes = list_all_notes(repo, local_ref)?;
 
     // 2. Resolve parent commit SHAs for the merge commit
-    let local_commit = rev_parse(repo, &local_ref)?;
+    let local_commit = rev_parse(repo, local_ref)?;
     let source_commit = rev_parse(repo, source_ref)?;
 
     // Nothing to merge if both refs point to the same commit.
@@ -933,7 +1018,7 @@ pub fn fallback_merge_notes_ours(repo: &Repository, source_ref: &str) -> Result<
 fn list_all_notes(repo: &Repository, notes_ref: &str) -> Result<Vec<(String, String)>, GitAiError> {
     // `git notes list` uses --ref to specify which notes ref.
     // The --ref option prepends "refs/notes/" automatically, so for full refs
-    // like "refs/notes/ai-remote/origin" we need to strip the prefix.
+    // like `refs/notes/<notes-ref>-remote/<remote>` we need to strip the prefix.
     let ref_arg = notes_ref.strip_prefix("refs/notes/").unwrap_or(notes_ref);
 
     let mut args = repo.global_args_for_exec();
@@ -983,27 +1068,36 @@ pub fn copy_ref(repo: &Repository, source_ref: &str, dest_ref: &str) -> Result<(
 }
 
 /// Search AI notes for a pattern and return matching commit SHAs ordered by commit date (newest first)
-/// Uses git grep to search through refs/notes/ai
+/// Uses git grep to search through the configured authorship ref
 pub(in crate::git) fn grep_ai_notes(
     repo: &Repository,
     pattern: &str,
+) -> Result<Vec<String>, GitAiError> {
+    grep_ai_notes_from_ref(repo, pattern, &authorship_notes_ref()?)
+}
+
+pub(in crate::git) fn grep_ai_notes_from_ref(
+    repo: &Repository,
+    pattern: &str,
+    notes_ref: &AuthorshipNotesRef,
 ) -> Result<Vec<String>, GitAiError> {
     let mut args = repo.global_args_for_exec();
     args.push("--no-pager".to_string());
     args.push("grep".to_string());
     args.push("-nI".to_string());
     args.push(pattern.to_string());
-    args.push("refs/notes/ai".to_string());
+    args.push(notes_ref.full.clone());
 
     let output = exec_git(&args)?;
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| GitAiError::Generic("Failed to parse git grep output".to_string()))?;
 
-    // Parse output format: refs/notes/ai:ab/cdef123...:line_number:matched_content
+    // Parse output format: the configured authorship ref:ab/cdef123...:line_number:matched_content
     // Extract the commit SHA from the path
     let mut shas = HashSet::new();
+    let ref_prefix = format!("{}:", notes_ref.full);
     for line in stdout.lines() {
-        if let Some(path_and_rest) = line.strip_prefix("refs/notes/ai:")
+        if let Some(path_and_rest) = line.strip_prefix(&ref_prefix)
             && let Some(path_end) = path_and_rest.find(':')
         {
             let path = &path_and_rest[..path_end];
@@ -1058,7 +1152,7 @@ pub(crate) fn sort_commit_shas_by_date_desc(
 ///
 /// Production code must go through `crate::git::notes_api`, which dispatches on
 /// the configured notes backend — calling these directly silently ignores the
-/// HTTP backend (notes live in the notes-db cache there, not refs/notes/ai).
+/// HTTP backend (notes live in the notes-db cache there, not the configured authorship ref).
 /// The underlying functions are `pub(in crate::git)` to enforce that; these
 /// wrappers exist so backend unit tests can exercise the raw git
 /// implementation regardless of backend configuration.
@@ -1066,12 +1160,26 @@ pub(crate) fn sort_commit_shas_by_date_desc(
 pub mod git_backend_for_tests {
     use super::*;
 
+    pub fn copy_missing_notes_for_commits_from_ref_into(
+        repo: &Repository,
+        source_ref: &str,
+        commit_shas: &[String],
+        notes_ref: &AuthorshipNotesRef,
+    ) -> Result<usize, GitAiError> {
+        super::copy_missing_notes_for_commits_from_ref_into(
+            repo,
+            source_ref,
+            commit_shas,
+            notes_ref,
+        )
+    }
+
     pub fn notes_add(
         repo: &Repository,
         commit_sha: &str,
         note_content: &str,
     ) -> Result<(), GitAiError> {
-        super::notes_add(repo, commit_sha, note_content)
+        super::notes_add_batch(repo, &[(commit_sha.to_string(), note_content.to_string())])
     }
 
     pub fn show_authorship_note(repo: &Repository, commit_sha: &str) -> Option<String> {
@@ -1228,20 +1336,26 @@ mod tests {
     #[test]
     fn test_flat_note_pathspec_for_commit() {
         let sha = "abcdef1234567890abcdef1234567890abcdef12";
-        let pathspec = flat_note_pathspec_for_commit(sha);
+        let pathspec = flat_note_pathspec_for_commit(sha).unwrap();
         assert_eq!(
             pathspec,
-            "refs/notes/ai:abcdef1234567890abcdef1234567890abcdef12"
+            format!(
+                "{}:abcdef1234567890abcdef1234567890abcdef12",
+                AI_AUTHORSHIP_FULL_REF
+            )
         );
     }
 
     #[test]
     fn test_fanout_note_pathspec_for_commit() {
         let sha = "abcdef1234567890abcdef1234567890abcdef12";
-        let pathspec = fanout_note_pathspec_for_commit(sha);
+        let pathspec = fanout_note_pathspec_for_commit(sha).unwrap();
         assert_eq!(
             pathspec,
-            "refs/notes/ai:ab/cdef1234567890abcdef1234567890abcdef12"
+            format!(
+                "{}:ab/cdef1234567890abcdef1234567890abcdef12",
+                AI_AUTHORSHIP_FULL_REF
+            )
         );
     }
 
@@ -1264,21 +1378,21 @@ mod tests {
     #[test]
     fn test_tracking_ref_for_remote() {
         assert_eq!(
-            tracking_ref_for_remote("origin"),
-            "refs/notes/ai-remote/origin"
+            tracking_ref_for_remote("origin").unwrap(),
+            format!("{}-remote/origin", AI_AUTHORSHIP_FULL_REF)
         );
         assert_eq!(
-            tracking_ref_for_remote("upstream"),
-            "refs/notes/ai-remote/upstream"
+            tracking_ref_for_remote("upstream").unwrap(),
+            format!("{}-remote/upstream", AI_AUTHORSHIP_FULL_REF)
         );
         assert_eq!(
-            tracking_ref_for_remote("my-fork"),
-            "refs/notes/ai-remote/my-fork"
+            tracking_ref_for_remote("my-fork").unwrap(),
+            format!("{}-remote/my-fork", AI_AUTHORSHIP_FULL_REF)
         );
         // Special characters get sanitized
         assert_eq!(
-            tracking_ref_for_remote("remote/with/slashes"),
-            "refs/notes/ai-remote/remote_with_slashes"
+            tracking_ref_for_remote("remote/with/slashes").unwrap(),
+            format!("{}-remote/remote_with_slashes", AI_AUTHORSHIP_FULL_REF)
         );
     }
 }

@@ -1,3 +1,7 @@
+// Modified by alfypops, 2026: configurable authorship notes namespace coverage.
+// Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: register pool home cleanup tests.
+// Modified by alfypops, 2026: register daemon_repo_roots tests.
 // Shared infrastructure — declared once for all test modules
 #[macro_use]
 #[allow(dead_code)]
@@ -52,6 +56,7 @@ mod continue_cli;
 mod cross_repo_cwd_attribution;
 mod cursor;
 mod daemon_commit_carryover;
+mod daemon_repo_roots;
 mod daemon_runtime_memory;
 mod debug_diagnostics;
 mod diff;
@@ -95,11 +100,15 @@ mod metrics_retry_idle;
 mod multi_repo_workspace;
 mod non_utf8_files;
 mod notes_merge_mixed_fanout;
+mod notes_push_policy;
+mod notes_ref;
 mod opencode;
 mod pending_ai_edit_suppression;
 mod performance;
 mod performance_targets;
 mod pi;
+#[cfg(unix)]
+mod pool_home_cleanup;
 mod post_commit_unit;
 mod pre_commit_unit;
 mod prompt_across_commit;

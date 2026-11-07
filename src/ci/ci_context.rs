@@ -1,14 +1,17 @@
+// Modified by alfypops, 2026: central authorship notes namespace.
+// Modified by alfypops, 2026: local-only notes push option
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::rewrite::{RewriteEvent, handle_rewrite_event};
 use crate::error::GitAiError;
 use crate::git::notes_api::{read_authorship_v3, read_note};
 use crate::git::refs::{
-    AI_AUTHORSHIP_FORK_TRACKING_REF, copy_missing_notes_for_commits_from_ref, ref_exists,
+    AuthorshipNotesRef, authorship_notes_ref, copy_missing_notes_for_commits_from_ref_into,
+    ref_exists,
 };
 use crate::git::repository::{
     CommitRange, Repository, exec_git, exec_git_allow_nonzero, exec_git_stdin,
 };
-use crate::git::sync_authorship::fetch_authorship_notes;
+use crate::git::sync_authorship::{NotesPushDecision, fetch_authorship_notes};
 use std::fs;
 use std::path::PathBuf;
 
@@ -183,9 +186,7 @@ impl CiContext {
                         if options.skip_push {
                             println!("Skipping authorship push (--skip-push). Done.");
                         } else {
-                            println!("Pushing authorship...");
-                            self.repo.push_authorship("origin")?;
-                            println!("Pushed authorship. Done.");
+                            self.push_authorship_and_report()?;
                         }
                         return Ok(CiRunResult::ForkNotesPreserved);
                     }
@@ -217,9 +218,7 @@ impl CiContext {
                             if options.skip_push {
                                 println!("Skipping authorship push (--skip-push). Done.");
                             } else {
-                                println!("Pushing authorship...");
-                                self.repo.push_authorship("origin")?;
-                                println!("Pushed authorship. Done.");
+                                self.push_authorship_and_report()?;
                             }
                             return Ok(CiRunResult::ForkNotesPreserved);
                         }
@@ -375,9 +374,7 @@ impl CiContext {
                         if options.skip_push {
                             println!("Skipping authorship push (--skip-push). Done.");
                         } else {
-                            println!("Pushing authorship...");
-                            self.repo.push_authorship("origin")?;
-                            println!("Pushed authorship. Done.");
+                            self.push_authorship_and_report()?;
                         }
                         Ok(CiRunResult::AuthorshipRewritten { authorship_log })
                     }
@@ -550,9 +547,7 @@ impl CiContext {
                 if options.skip_push {
                     println!("Skipping authorship push (--skip-push). Done.");
                 } else {
-                    println!("Pushing authorship...");
-                    self.repo.push_authorship("origin")?;
-                    println!("Pushed authorship. Done.");
+                    self.push_authorship_and_report()?;
                 }
 
                 Ok(CiRunResult::SyncAuthorshipRewritten {
@@ -560,6 +555,17 @@ impl CiContext {
                 })
             }
         }
+    }
+
+    fn push_authorship_and_report(&self) -> Result<(), GitAiError> {
+        println!("Pushing authorship...");
+        match self.repo.push_authorship("origin")? {
+            NotesPushDecision::Allowed => println!("Pushed authorship. Done."),
+            NotesPushDecision::Skipped(reason) => {
+                println!("Skipping authorship push: {}. Done.", reason);
+            }
+        }
+        Ok(())
     }
 
     pub fn teardown(&self) -> Result<(), GitAiError> {
@@ -574,14 +580,18 @@ impl CiContext {
     /// Fetch authorship notes from a fork repository URL into the fork tracking ref.
     /// Returns Ok(true) if notes were found and fetched,
     /// Ok(false) if no notes exist on the fork.
-    fn fetch_fork_notes(repo: &Repository, fork_url: &str) -> Result<bool, GitAiError> {
-        let tracking_ref = AI_AUTHORSHIP_FORK_TRACKING_REF;
+    fn fetch_fork_notes(
+        repo: &Repository,
+        fork_url: &str,
+        notes_ref: &AuthorshipNotesRef,
+    ) -> Result<bool, GitAiError> {
+        let tracking_ref = notes_ref.tracking("fork");
 
         // Check if the fork has notes
         let mut ls_remote_args = repo.global_args_for_exec();
         ls_remote_args.push("ls-remote".to_string());
         ls_remote_args.push(fork_url.to_string());
-        ls_remote_args.push("refs/notes/ai".to_string());
+        ls_remote_args.push(notes_ref.full.clone());
 
         match exec_git(&ls_remote_args) {
             Ok(output) => {
@@ -599,7 +609,7 @@ impl CiContext {
         }
 
         // Fetch notes from the fork URL into a tracking ref
-        let fetch_refspec = format!("+refs/notes/ai:{}", tracking_ref);
+        let fetch_refspec = format!("+{}:{}", notes_ref.full, tracking_ref);
         let mut fetch_args = repo.global_args_for_exec();
         fetch_args.push("-c".to_string());
         fetch_args.push(format!("core.hooksPath={}", NULL_HOOKS));
@@ -631,18 +641,20 @@ impl CiContext {
             return Ok(0);
         }
 
+        let notes_ref = authorship_notes_ref()?;
+        let tracking_ref = notes_ref.tracking("fork");
         let source_ref_available = if options.skip_fetch_fork_notes {
             println!(
                 "Skipping fork authorship notes fetch; using {} if it exists",
-                AI_AUTHORSHIP_FORK_TRACKING_REF
+                tracking_ref
             );
-            ref_exists(&self.repo, AI_AUTHORSHIP_FORK_TRACKING_REF)
+            ref_exists(&self.repo, &tracking_ref)
         } else {
             println!(
                 "Fetching authorship notes from fork into {}...",
-                AI_AUTHORSHIP_FORK_TRACKING_REF
+                tracking_ref
             );
-            match Self::fetch_fork_notes(&self.repo, fork_url) {
+            match Self::fetch_fork_notes(&self.repo, fork_url, &notes_ref) {
                 Ok(true) => {
                     println!("Fetched authorship notes from fork");
                     true
@@ -665,23 +677,24 @@ impl CiContext {
             return Ok(0);
         }
 
-        let copied = copy_missing_notes_for_commits_from_ref(
+        let copied = copy_missing_notes_for_commits_from_ref_into(
             &self.repo,
-            AI_AUTHORSHIP_FORK_TRACKING_REF,
+            &tracking_ref,
             commit_shas,
+            &notes_ref,
         )?;
         println!(
             "Imported {} fork authorship notes for {} PR commits from {}",
             copied,
             commit_shas.len(),
-            AI_AUTHORSHIP_FORK_TRACKING_REF
+            tracking_ref
         );
         Ok(copied)
     }
 
     fn has_notes_for_any_commit(&self, commit_shas: &[String]) -> Result<bool, GitAiError> {
         // Backend-aware: on the HTTP backend notes live in the notes-db cache,
-        // so a refs/notes/ai-only check would always report "no notes".
+        // so a Git-only check would always report "no notes".
         Ok(!crate::git::notes_api::commits_with_notes(&self.repo, commit_shas)?.is_empty())
     }
 

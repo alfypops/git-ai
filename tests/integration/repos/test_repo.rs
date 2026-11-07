@@ -1,3 +1,7 @@
+// Modified by alfypops, 2026: retain namespace and push policy patches across daemon restart.
+// Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: shared daemon pool homes are removed at exit and swept when stale.
+// Modified by alfypops, 2026: completion-log access for repos sharing a daemon (daemon_repo_roots).
 #![allow(dead_code)]
 
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
@@ -505,12 +509,28 @@ impl DaemonProcess {
     }
 }
 
-fn configure_test_home_env(command: &mut Command, test_home: &Path) {
-    command.env("HOME", test_home);
-    if !command
+/// Remove ambient routing/settings while keeping intentional command overrides.
+fn scrub_ambient_git_test_env(command: &mut Command) {
+    let explicit: std::collections::HashSet<_> = command
         .get_envs()
-        .any(|(key, _)| key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH"))
-    {
+        .filter_map(|(key, value)| value.map(|_| key.to_owned()))
+        .collect();
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if (name.starts_with("GIT_TRACE2") || name.starts_with("GIT_AI_"))
+            && !explicit.contains(&key)
+        {
+            command.env_remove(key);
+        }
+    }
+}
+
+fn configure_test_home_env(command: &mut Command, test_home: &Path) {
+    scrub_ambient_git_test_env(command);
+    command.env("HOME", test_home);
+    if !command.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new("GIT_AI_TEST_NOTES_DB_PATH") && value.is_some()
+    }) {
         command.env(
             "GIT_AI_TEST_NOTES_DB_PATH",
             test_home.join(".git-ai").join("internal").join("notes-db"),
@@ -575,6 +595,7 @@ fn run_command_output_with_stdin(
     label: &str,
     stdin_data: &[u8],
 ) -> Result<Output, String> {
+    scrub_ambient_git_test_env(command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -596,6 +617,7 @@ fn run_command_output_with_timeout(
     label: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    scrub_ambient_git_test_env(command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -687,6 +709,10 @@ fn output_tail(bytes: &[u8]) -> String {
 static SHARED_DAEMON_PROCESS: OnceLock<Arc<DaemonProcess>> = OnceLock::new();
 static SHARED_DAEMON_POOL: OnceLock<Mutex<HashMap<usize, Arc<DaemonProcess>>>> = OnceLock::new();
 static SHARED_DAEMON_EXIT_HOOK: OnceLock<()> = OnceLock::new();
+#[cfg(unix)]
+static SHARED_DAEMON_SWEEP: std::sync::Once = std::sync::Once::new();
+const SHARED_DAEMON_DIR_PREFIX: &str = "git-ai-shared-daemon-";
+const SHARED_DAEMON_OWNER_MARKER: &str = "owner.pid";
 static DAEMON_SYNC_REGISTRY: OnceLock<Mutex<DaemonSyncRegistry>> = OnceLock::new();
 static SHARED_DAEMON_POOL_ASSIGNMENT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 static TEST_SYNC_SESSION_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -749,7 +775,7 @@ fn shared_daemon_pool_size() -> usize {
 
 extern "C" fn shutdown_shared_daemon_at_process_exit() {
     if let Some(daemon) = SHARED_DAEMON_PROCESS.get() {
-        daemon.shutdown();
+        shutdown_and_remove_shared_daemon(daemon);
     }
     if let Some(pool) = SHARED_DAEMON_POOL.get() {
         let daemons = {
@@ -757,8 +783,19 @@ extern "C" fn shutdown_shared_daemon_at_process_exit() {
             pool.drain().map(|(_, daemon)| daemon).collect::<Vec<_>>()
         };
         for daemon in daemons {
-            daemon.shutdown();
+            shutdown_and_remove_shared_daemon(&daemon);
         }
+    }
+}
+
+fn shutdown_and_remove_shared_daemon(daemon: &DaemonProcess) {
+    daemon.shutdown();
+    remove_pool_dirs(&[&daemon.daemon_home, &daemon.test_db_path]);
+}
+
+fn remove_pool_dirs(dirs: &[&Path]) {
+    for dir in dirs {
+        let _ = remove_dir_all_with_retry(dir, 40, Duration::from_millis(25));
     }
 }
 
@@ -771,6 +808,8 @@ fn register_shared_daemon_exit_hook() {
 
 fn shared_daemon_process(repo_path: &Path) -> Arc<DaemonProcess> {
     register_shared_daemon_exit_hook();
+    #[cfg(unix)]
+    SHARED_DAEMON_SWEEP.call_once(|| sweep_stale_shared_daemon_dirs(&std::env::temp_dir()));
     let pool_size = shared_daemon_pool_size();
     if pool_size <= 1 {
         return SHARED_DAEMON_PROCESS
@@ -793,9 +832,59 @@ fn start_shared_daemon_process(repo_path: &Path, shard: Option<usize>) -> Daemon
     let shard_suffix = shard
         .map(|shard| format!("-pool-{}", shard))
         .unwrap_or_default();
-    let daemon_home = base.join(format!("git-ai-shared-daemon-{}{}-home", n, shard_suffix));
-    let test_db_path = base.join(format!("git-ai-shared-daemon-{}{}-db", n, shard_suffix));
-    DaemonProcess::start(repo_path, &daemon_home, &test_db_path)
+    let daemon_home = base.join(format!("{SHARED_DAEMON_DIR_PREFIX}{n}{shard_suffix}-home"));
+    let test_db_path = base.join(format!("{SHARED_DAEMON_DIR_PREFIX}{n}{shard_suffix}-db"));
+    fs::create_dir_all(&daemon_home).expect("failed to create shared daemon home");
+    fs::write(
+        daemon_home.join(SHARED_DAEMON_OWNER_MARKER),
+        std::process::id().to_string(),
+    )
+    .expect("failed to write shared daemon owner marker");
+    // A start that fails readiness panics inside `start`, before the daemon is registered in
+    // the statics the exit hook walks, so its dirs are removed here.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        DaemonProcess::start(repo_path, &daemon_home, &test_db_path)
+    }))
+    .unwrap_or_else(|panic| {
+        remove_pool_dirs(&[&daemon_home, &test_db_path]);
+        std::panic::resume_unwind(panic)
+    })
+}
+
+/// Removes pool homes (and their db dirs) whose owning test process is gone, e.g. after a crash.
+/// Homes owned by a live process, or without an owner marker (possibly a concurrent run of an
+/// older harness), are left alone.
+#[cfg(unix)]
+fn sweep_stale_shared_daemon_dirs(base: &Path) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    let mut unmarked = 0;
+    for home in entries.flatten().map(|entry| entry.path()) {
+        let Some(stem) = home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| name.starts_with(SHARED_DAEMON_DIR_PREFIX))
+            .and_then(|name| name.strip_suffix("-home"))
+        else {
+            continue;
+        };
+        let owner = fs::read_to_string(home.join(SHARED_DAEMON_OWNER_MARKER))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+            .map(|pid| pid as u32);
+        match owner {
+            Some(pid) if !is_process_alive(pid) => {
+                remove_pool_dirs(&[&home, &base.join(format!("{stem}-db"))]);
+            }
+            Some(_) => {}
+            None => unmarked += 1,
+        }
+    }
+    if unmarked > 0 {
+        eprintln!("leaving {unmarked} shared daemon home(s) without an owner marker untouched");
+    }
 }
 
 impl Drop for DaemonProcess {
@@ -1210,6 +1299,15 @@ impl TestRepo {
 
         let mut config = serde_json::Map::new();
 
+        if let Some(notes_ref) = &patch.notes_ref {
+            config.insert("notes_ref".to_string(), notes_ref.clone());
+        }
+        if let Some(notes_push) = &patch.notes_push {
+            config.insert(
+                "notes_push".to_string(),
+                serde_json::to_value(notes_push).unwrap(),
+            );
+        }
         if let Some(git_path) = &patch.git_path {
             config.insert(
                 "git_path".to_string(),
@@ -1972,6 +2070,26 @@ impl TestRepo {
     pub(crate) fn daemon_completion_entries(&self) -> Vec<DaemonTestCompletionLogEntry> {
         let family_key = self.daemon_family_key();
         self.daemon_completion_entries_for_family(&family_key)
+    }
+
+    /// Completion-log entries this repo's daemon recorded for another
+    /// repository's family (one that shares the daemon via raw traced git).
+    pub(crate) fn daemon_completion_entries_for_repo(
+        &self,
+        repo_path: &Path,
+    ) -> Vec<DaemonTestCompletionLogEntry> {
+        self.daemon_completion_entries_for_family(&self.daemon_family_key_for_repo_path(repo_path))
+    }
+
+    /// Waits until this repo's daemon has completed the command tagged
+    /// `git-ai.testSyncSession=<session>` in another repository's family.
+    pub(crate) fn wait_for_daemon_completion_session_for_repo(
+        &self,
+        repo_path: &Path,
+        session: &str,
+    ) {
+        let family_key = self.daemon_family_key_for_repo_path(repo_path);
+        self.wait_for_daemon_completion_sessions(&family_key, &[session.to_string()]);
     }
 
     pub(crate) fn daemon_stderr_contents(&self) -> String {
@@ -4041,6 +4159,101 @@ pub fn get_binary_path() -> &'static PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn test_git_children_ignore_ambient_trace2_and_preserve_owned_settings() {
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bogus_socket = format!(
+            "af_unix:stream:{}",
+            dir.path().join("ambient.sock").display()
+        );
+        let settings = [
+            ("GIT_TRACE2", "1"),
+            ("GIT_TRACE2_EVENT", bogus_socket.as_str()),
+            ("GIT_TRACE2_EVENT_NESTING", "0"),
+            ("GIT_TRACE2_PERF", "1"),
+            ("GIT_AI_NOTES_PUSH", "never"),
+            ("GIT_AI_TEST_NOTES_DB_PATH", "ambient-notes-db"),
+        ];
+        let _restore = RestoreEnv(
+            settings
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in settings {
+            unsafe { std::env::set_var(key, value) };
+        }
+        let env_value = |command: &Command, name: &str| {
+            command
+                .get_envs()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+        };
+        let mut fixture = Command::new(real_git_executable());
+        configure_test_home_env(&mut fixture, dir.path());
+        assert_eq!(
+            env_value(&fixture, "GIT_TRACE2_EVENT"),
+            Some(None),
+            "fixture must not inherit ambient Trace2"
+        );
+        assert_eq!(env_value(&fixture, "GIT_AI_NOTES_PUSH"), Some(None));
+        assert_eq!(
+            env_value(&fixture, "GIT_AI_TEST_NOTES_DB_PATH"),
+            Some(Some(
+                dir.path()
+                    .join(".git-ai/internal/notes-db")
+                    .into_os_string()
+            ))
+        );
+
+        // Raw clone/template launchers also go through this central runner.
+        let mut raw = Command::new(real_git_executable());
+        raw.arg("--version");
+        let output = run_command_output(&mut raw, "hermetic raw Git guard").unwrap();
+        assert!(output.status.success());
+        for (key, _) in settings {
+            assert_eq!(
+                env_value(&raw, key),
+                Some(None),
+                "raw Git must not inherit {key}"
+            );
+        }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("ambient.sock"));
+
+        let owned_trace = dir.path().join("owned-trace.json");
+        let mut owned = Command::new(real_git_executable());
+        owned
+            .arg("--version")
+            .env("GIT_TRACE2_EVENT", &owned_trace)
+            .env("GIT_AI_NOTES_PUSH", "always");
+        configure_test_home_env(&mut owned, dir.path());
+        let output = run_command_output(&mut owned, "explicit test trace guard").unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            env_value(&owned, "GIT_TRACE2_EVENT"),
+            Some(Some(owned_trace.clone().into_os_string()))
+        );
+        assert_eq!(
+            env_value(&owned, "GIT_AI_NOTES_PUSH"),
+            Some(Some("always".into()))
+        );
+        assert!(!std::fs::read(&owned_trace).unwrap().is_empty());
+    }
 
     #[test]
     fn test_configure_test_home_env_isolates_notes_database() {

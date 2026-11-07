@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: configured authorship namespace descriptions.
 use crate::config::NotesBackendKind;
 use crate::error::GitAiError;
 use crate::git::find_repository;
@@ -93,7 +94,7 @@ pub fn handle_fetch_notes(args: &[String]) {
     let start = Instant::now();
 
     // When the HTTP notes backend is enabled, warm the local notes-db cache
-    // from the HTTP backend instead of fetching refs/notes/ai.
+    // from the HTTP backend instead of fetching the configured authorship ref.
     if crate::config::Config::get().notes_backend_kind() == NotesBackendKind::Http {
         match crate::git::notes_api::warm_cache_for_remote(&repo, &remote_name) {
             Ok(()) => {

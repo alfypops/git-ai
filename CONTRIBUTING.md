@@ -1,4 +1,11 @@
+<!-- Modified by alfypops, 2026: fork preamble on where contributions and reports go -->
 # Contributing to Git AI
+
+> **This is the alfypops build of git-ai**, based on upstream v1.7.5 and maintained separately from [git-ai-project/git-ai](https://github.com/git-ai-project/git-ai).
+> - Most contributions belong upstream. Changes here are limited to what CodeSense needs (see the banner in [README.md](README.md)).
+> - Bugs in this build: open an issue in this repository. If the bug also happens with upstream git-ai, report it upstream instead.
+> - Vulnerabilities: never in a public issue. Follow [SECURITY.md](SECURITY.md).
+> - The rest of this guide is upstream's. Its Discord and maintainer contacts are for upstream git-ai, not for this build.
 
 Thank you for your interest in contributing to `git-ai`. This is a cool moment for the industry and we're all here to build ~~a~~ the standard for tracking AI code. 
 

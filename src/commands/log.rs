@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: central authorship notes namespace.
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::authorship::ignore::effective_ignore_patterns;
 use crate::authorship::stats::{
@@ -186,7 +187,7 @@ impl Default for ParsedLogArgs {
 
 /// Handle the `git ai log` command.
 ///
-/// Unlike the old implementation, this does not proxy to `git log --notes=ai`.
+/// Unlike the old implementation, this does not proxy to `git log --notes=<notes-ref>`.
 /// It streams commits from git with a stable machine-readable format, resolves
 /// authorship notes through the configured notes backend, and renders Git AI
 /// stats by default. Raw note content is shown only with `--raw` or `--notes`.
@@ -232,14 +233,22 @@ fn run_log(args: &[String]) -> Result<ExitStatus, LogError> {
 
 fn run_plain_log(global_args: &[String], git_log_args: &[String]) -> Result<ExitStatus, LogError> {
     if Config::get().notes_backend_kind() != NotesBackendKind::GitNotes {
-        return Err(LogError::Message(
-            "plain git log --notes=ai only supports the git_notes backend".to_string(),
-        ));
+        return Err(LogError::Message(format!(
+            "plain git log --notes={} only supports the git_notes backend",
+            crate::git::refs::authorship_notes_ref()
+                .map_err(LogError::Git)?
+                .name
+        )));
     }
 
     let mut command_args = global_args.to_vec();
     command_args.push("log".to_string());
-    command_args.push("--notes=ai".to_string());
+    command_args.push(format!(
+        "--notes={}",
+        crate::git::refs::authorship_notes_ref()
+            .map_err(LogError::Git)?
+            .name
+    ));
     command_args.extend(git_log_args.iter().cloned());
 
     let mut child = crate::git::repository::spawn_git_passthrough(&command_args)?;
@@ -359,7 +368,9 @@ fn print_log_help() {
     println!("Options:");
     println!("  --raw, --notes    Include raw authorship note data after the stats");
     println!("  --show-notes      Alias for --notes");
-    println!("  --plain           Run git log --notes=ai directly (git_notes backend only)");
+    println!(
+        "  --plain           Run git log with the configured notes ref (git_notes backend only)"
+    );
     println!("  --oneline         Compact commit header");
     println!("  --no-decorate     Hide ref decorations");
     println!("  --no-pager        Stream output instead of opening the pager");

@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::authorship::imara_diff_utils::{LineChangeTag, compute_line_changes};
 use crate::error::GitAiError;
 use jsonc_parser::ParseOptions;
@@ -478,7 +479,7 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
     // write_atomic is reached. See #1039.
     ensure_parent_dir(&target_path)?;
 
-    let tmp_path = target_path.with_extension("tmp");
+    let tmp_path = target_path.with_extension(format!("tmp.{}", crate::uuid::generate_v4()));
     {
         let mut file = fs::File::create(&tmp_path).map_err(|e| {
             GitAiError::Generic(format!(
@@ -487,6 +488,9 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), GitAiError> {
                 e
             ))
         })?;
+        if let Ok(metadata) = fs::metadata(&target_path) {
+            file.set_permissions(metadata.permissions())?;
+        }
         file.write_all(data)?;
         file.sync_all()?;
     }

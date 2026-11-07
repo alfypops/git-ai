@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::test_utils::fixture_path;
 use git_ai::authorship::authorship_log_serialization::generate_session_id;
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
@@ -391,12 +392,10 @@ fn test_opencode_e2e_checkpoint_and_commit() {
     let fixture_db = opencode_sqlite_fixture_path().join("opencode.db");
     fs::copy(&fixture_db, storage_path.join("opencode.db")).unwrap();
 
-    unsafe {
-        std::env::set_var(
-            "GIT_AI_OPENCODE_STORAGE_PATH",
-            storage_path.to_str().unwrap(),
-        );
-    }
+    let fixture_env = [(
+        "GIT_AI_OPENCODE_STORAGE_PATH",
+        storage_path.to_str().unwrap(),
+    )];
 
     let pre_hook_input = json!({
         "hook_event_name": "PreToolUse",
@@ -408,8 +407,11 @@ fn test_opencode_e2e_checkpoint_and_commit() {
     })
     .to_string();
 
-    repo.git_ai(&["checkpoint", "opencode", "--hook-input", &pre_hook_input])
-        .unwrap();
+    repo.git_ai_with_env(
+        &["checkpoint", "opencode", "--hook-input", &pre_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     fs::write(&file_path, "// initial\n// Hello World\n").unwrap();
 
@@ -423,8 +425,11 @@ fn test_opencode_e2e_checkpoint_and_commit() {
     })
     .to_string();
 
-    repo.git_ai(&["checkpoint", "opencode", "--hook-input", &post_hook_input])
-        .unwrap();
+    repo.git_ai_with_env(
+        &["checkpoint", "opencode", "--hook-input", &post_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     let session_id = generate_session_id("test-session-123", "opencode");
     repo.sync_daemon_force();
@@ -453,10 +458,6 @@ fn test_opencode_e2e_checkpoint_and_commit() {
         emitted_session_event,
         "OpenCode post-checkpoint should emit transcript events for its generated session ID"
     );
-
-    unsafe {
-        std::env::remove_var("GIT_AI_OPENCODE_STORAGE_PATH");
-    }
 
     let commit = repo.stage_all_and_commit("Add AI line").unwrap();
 
@@ -561,12 +562,10 @@ fn test_opencode_checkpoint_tool_use_id_matches_transcript_callid() {
     let fixture_db = fixture_path("opencode-sqlite/opencode.db");
     std::fs::copy(&fixture_db, storage_path.join("opencode.db")).unwrap();
 
-    unsafe {
-        std::env::set_var(
-            "GIT_AI_OPENCODE_STORAGE_PATH",
-            storage_path.to_str().unwrap(),
-        );
-    }
+    let fixture_env = [(
+        "GIT_AI_OPENCODE_STORAGE_PATH",
+        storage_path.to_str().unwrap(),
+    )];
 
     let pre_hook_input = json!({
         "hook_event_name": "PreToolUse",
@@ -580,8 +579,11 @@ fn test_opencode_checkpoint_tool_use_id_matches_transcript_callid() {
     })
     .to_string();
 
-    repo.git_ai(&["checkpoint", "opencode", "--hook-input", &pre_hook_input])
-        .unwrap();
+    repo.git_ai_with_env(
+        &["checkpoint", "opencode", "--hook-input", &pre_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     std::fs::write(&file_path, "// initial\n// AI edit\n").unwrap();
 
@@ -597,12 +599,11 @@ fn test_opencode_checkpoint_tool_use_id_matches_transcript_callid() {
     })
     .to_string();
 
-    repo.git_ai(&["checkpoint", "opencode", "--hook-input", &post_hook_input])
-        .unwrap();
-
-    unsafe {
-        std::env::remove_var("GIT_AI_OPENCODE_STORAGE_PATH");
-    }
+    repo.git_ai_with_env(
+        &["checkpoint", "opencode", "--hook-input", &post_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     let commit = repo.stage_all_and_commit("Add AI line").unwrap();
 

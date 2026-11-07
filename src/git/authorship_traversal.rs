@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: central authorship notes namespace.
 use std::collections::HashSet;
 
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -61,7 +62,10 @@ pub fn commits_have_authorship_notes(
 fn get_notes_list(global_args: &[String]) -> Result<Vec<(String, String)>, GitAiError> {
     let mut args = global_args.to_vec();
     args.push("notes".to_string());
-    args.push("--ref=ai".to_string());
+    args.push(format!(
+        "--ref={}",
+        crate::git::refs::authorship_notes_ref()?.name
+    ));
     args.push("list".to_string());
 
     let output = match exec_git(&args) {

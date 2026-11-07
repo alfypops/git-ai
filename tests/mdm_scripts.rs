@@ -1,3 +1,5 @@
+//! Modified by alfypops, 2026: the fork ships no GitHub workflows, so the release-workflow check is dropped.
+//! Modified by alfypops, 2026: the download check asserts the upstream release URL and the asset-to-script mapping.
 //! Static checks on the MDM login-start scripts in `mdm/`.
 //!
 //! These scripts register `git-ai bg start` to run at login. The daemon
@@ -179,26 +181,42 @@ fn readme_documents_the_launch_invariants() {
 }
 
 #[test]
-fn release_workflow_publishes_the_scripts_as_assets() {
-    let release = repo_file(".github/workflows/release.yml");
+fn readme_documents_the_script_downloads() {
+    // This fork publishes no login-start assets. The README must send users to
+    // upstream's release, and each documented asset must map to a script here.
     let readme = mdm_file("README.md");
 
-    for asset in [
-        "git-ai-login-start-macos.sh",
-        "git-ai-login-start-linux.sh",
-        "git-ai-login-start-windows.ps1",
+    assert!(
+        readme.contains(
+            "`https://github.com/git-ai-project/git-ai/releases/latest/download/<asset>`"
+        ),
+        "mdm/README.md must point downloads at the upstream git-ai-project release"
+    );
+    for (script, asset) in [
+        (
+            "macos/install-login-start.sh",
+            "git-ai-login-start-macos.sh",
+        ),
+        (
+            "linux/install-login-start.sh",
+            "git-ai-login-start-linux.sh",
+        ),
+        (
+            "windows/install-login-start.ps1",
+            "git-ai-login-start-windows.ps1",
+        ),
     ] {
+        let row = readme
+            .lines()
+            .find(|line| line.starts_with('|') && line.contains(&format!("`{asset}`")))
+            .unwrap_or_else(|| panic!("mdm/README.md table must list the {asset} asset"));
         assert!(
-            release.contains(asset),
-            "release.yml must copy {asset} into the release assets"
+            row.contains(&format!("`{script}`")),
+            "mdm/README.md must map {asset} to {script}, got: {row}"
         );
         assert!(
-            readme.contains(asset),
-            "mdm/README.md must document the {asset} download"
+            !mdm_file(script).is_empty(),
+            "mdm/{script} must exist for the documented {asset} asset"
         );
     }
-    assert!(
-        release.contains("sha256sum install.sh install.ps1 git-ai-login-start-*"),
-        "login-start assets must be covered by SHA256SUMS"
-    );
 }

@@ -1,3 +1,6 @@
+// Modified by alfypops, 2026: cover configurable authorship notes namespace.
+// Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: daemon_repo_roots CLI coverage.
 //! Integration coverage for `git-ai config` keys that previously had no CLI
 //! handling: `allow_superuser`, `transcript_streaming_lookback_days`, and
 //! `custom_attributes` (including its nested `custom_attributes.<key>` form).
@@ -6,7 +9,7 @@
 //! writes land in the sandboxed `~/.git-ai/config.json` rather than the user's.
 
 use crate::repos::test_repo::TestRepo;
-use git_ai::config::{AuthorConfig, FileConfig, NotesBackendConfig};
+use git_ai::config::{AuthorConfig, FileConfig, NotesBackendConfig, NotesPush};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -437,6 +440,7 @@ fn fully_populated_file_config() -> FileConfig {
         allow_repositories: Some(vec!["*".to_string()]),
         exclude_repositories: Some(vec!["*".to_string()]),
         untraced_fixup_ignored_paths: Some(vec!["*-scratch/.git".to_string()]),
+        daemon_repo_roots: Some(serde_json::json!(["/managed/clones"])),
         telemetry_oss: Some("off".to_string()),
         telemetry_enterprise_dsn: Some("https://example.com".to_string()),
         disable_version_checks: Some(true),
@@ -457,6 +461,9 @@ fn fully_populated_file_config() -> FileConfig {
         git_ai_hooks: Some(git_ai_hooks),
         codex_hooks_format: Some("config_toml".to_string()),
         notes_backend: Some(NotesBackendConfig::default()),
+        notes_ref: Some(serde_json::json!("ai")),
+        notes_push: Some(NotesPush::Always),
+        notes_push_repositories: Some(vec!["*".to_string()]),
         transcript_streaming_lookback_days: Some(7),
         max_checkpoint_file_size_bytes: Some(3 * 1024 * 1024),
         max_checkpoint_total_size_bytes: Some(32 * 1024 * 1024),

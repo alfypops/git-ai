@@ -1,3 +1,4 @@
+<!-- Modified by alfypops, 2026: the fork ships no GitHub workflows; the threshold is checked locally -->
 # Code Coverage Policy
 
 ## Overview
@@ -8,7 +9,7 @@ This project maintains a minimum code coverage threshold to ensure code quality 
 
 **Minimum Coverage: 50%** (line coverage)
 
-This threshold is enforced in CI via the GitHub Actions workflow at `.github/workflows/coverage.yml`.
+This fork ships no GitHub workflows, so nothing enforces the threshold in CI. Check it locally with `task coverage:check`, which defaults to 50% (`COVERAGE_THRESHOLD` in `Taskfile.yml`).
 
 ## How the Threshold is Determined
 
@@ -18,14 +19,6 @@ The threshold is calculated as:
 3. Set this as the minimum threshold
 
 **Example:** If current coverage is 54.10%, the threshold is set to 50%.
-
-## CI Enforcement
-
-Pull requests and pushes to main will fail if:
-- Code coverage falls below the configured threshold (50%)
-- This is enforced using `cargo llvm-cov --fail-under-lines` in CI
-
-Coverage reports are always generated and uploaded as artifacts, even if the threshold check fails.
 
 ## Checking Coverage Locally
 
@@ -51,20 +44,7 @@ task coverage:check
 
 ## Updating the Threshold
 
-When code coverage improves significantly, you can update the threshold:
-
-### Automatic Update
-```bash
-./scripts/update-coverage-threshold.sh
-```
-
-This script will:
-1. Run coverage analysis
-2. Calculate the new threshold (current coverage rounded down to nearest 5)
-3. Update `.github/workflows/coverage.yml`
-
-### Manual Update
-Edit `.github/workflows/coverage.yml` and update the `COVERAGE_THRESHOLD` environment variable.
+When code coverage improves significantly, raise the default `COVERAGE_THRESHOLD` in the `coverage:check` task in `Taskfile.yml` to the current coverage rounded down to the nearest 5%. To try a value without editing, run `task coverage:check COVERAGE_THRESHOLD=55`.
 
 ## Exclusions
 
@@ -77,11 +57,7 @@ This ensures coverage metrics focus on production code quality.
 
 ## Coverage Reports
 
-Coverage reports are generated on every CI run and available as artifacts:
-- **HTML Report**: Interactive browsable report showing line-by-line coverage
-- **LCOV Report**: Machine-readable format for IDE integration
-
-Artifacts are retained for 30 days.
+`task coverage:html` and `task coverage:lcov` write the reports locally.
 
 ## Best Practices
 

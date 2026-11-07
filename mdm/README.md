@@ -1,3 +1,4 @@
+<!-- Modified by alfypops, 2026: the fork ships no GitHub workflows; end-to-end tests run by hand -->
 # Git AI MDM helpers
 
 Scripts for managed (MDM) rollouts that start the Git AI background service
@@ -125,5 +126,5 @@ issuing other git commands. It should report a healthy daemon. Platform state:
 - `scripts/mdm/test-login-start.{sh,ps1}`: end-to-end on each OS. Registers the
   login start, simulates login, and checks the daemon survives the launcher
   exiting, restarts itself on schedule, and (nightly) self-updates from an older
-  release while registered. Run per PR by `.github/workflows/mdm-login-start.yml`
-  and nightly against the published release by `mdm-login-start-nightly.yml`.
+  release while registered. Upstream runs these in its CI; this fork ships no
+  GitHub workflows, so run them by hand on each OS.

@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: retain the operation namespace during metadata carry-over.
 use crate::authorship::attribution_tracker::{
     Attribution, LineAttribution, attributions_to_line_attributions,
     line_attributions_to_attributions,
@@ -10,6 +11,7 @@ use crate::authorship::imara_diff_utils::{
 use crate::authorship::working_log::CheckpointKind;
 use crate::commands::blame::{GitAiBlameOptions, OLDEST_AI_BLAME_DATE};
 use crate::error::GitAiError;
+use crate::git::refs::{AuthorshipNotesRef, authorship_notes_ref};
 use crate::git::repository::{Repository, batch_read_paths_at_treeishes};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -51,6 +53,23 @@ impl VirtualAttributions {
         pathspecs: &[String],
         blame_start_commit: Option<String>,
     ) -> Result<Self, GitAiError> {
+        Self::new_for_base_commit_in_ref(
+            repo,
+            base_commit,
+            pathspecs,
+            blame_start_commit,
+            &authorship_notes_ref()?,
+        )
+        .await
+    }
+
+    async fn new_for_base_commit_in_ref(
+        repo: Repository,
+        base_commit: String,
+        pathspecs: &[String],
+        blame_start_commit: Option<String>,
+        notes_ref: &AuthorshipNotesRef,
+    ) -> Result<Self, GitAiError> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -75,13 +94,18 @@ impl VirtualAttributions {
         }
 
         // After running blame, discover and load any missing prompts from blamed commits
-        virtual_attrs.discover_and_load_foreign_prompts().await?;
+        virtual_attrs
+            .discover_and_load_foreign_prompts(notes_ref)
+            .await?;
 
         Ok(virtual_attrs)
     }
 
     /// Discover and load prompts/sessions from blamed commits that aren't in our maps
-    async fn discover_and_load_foreign_prompts(&mut self) -> Result<(), GitAiError> {
+    async fn discover_and_load_foreign_prompts(
+        &mut self,
+        notes_ref: &AuthorshipNotesRef,
+    ) -> Result<(), GitAiError> {
         use std::collections::HashSet;
 
         // Collect all unique author_ids from attributions
@@ -109,7 +133,9 @@ impl VirtualAttributions {
 
         // Load missing prompts in parallel
         if !missing_prompt_ids.is_empty() {
-            let prompts = self.load_prompts_concurrent(&missing_prompt_ids).await?;
+            let prompts = self
+                .load_prompts_concurrent(&missing_prompt_ids, notes_ref)
+                .await?;
             for (id, commit_sha, prompt) in prompts {
                 self.prompts
                     .entry(id)
@@ -121,7 +147,10 @@ impl VirtualAttributions {
         // Load missing sessions from history
         if !missing_session_ids.is_empty() {
             let sessions = self
-                .load_sessions_concurrent(&missing_session_ids.into_iter().collect::<Vec<_>>())
+                .load_sessions_concurrent(
+                    &missing_session_ids.into_iter().collect::<Vec<_>>(),
+                    notes_ref,
+                )
                 .await?;
             for (session_id, session_record) in sessions {
                 self.sessions.entry(session_id).or_insert(session_record);
@@ -135,6 +164,7 @@ impl VirtualAttributions {
     async fn load_prompts_concurrent(
         &self,
         missing_ids: &[String],
+        notes_ref: &AuthorshipNotesRef,
     ) -> Result<Vec<(String, String, PromptRecord)>, GitAiError> {
         const MAX_CONCURRENT: usize = 30;
 
@@ -144,6 +174,7 @@ impl VirtualAttributions {
         for missing_id in missing_ids {
             let missing_id = missing_id.clone();
             let repo = self.repo.clone();
+            let notes_ref = notes_ref.clone();
             let semaphore = Arc::clone(&semaphore);
 
             let task = async move {
@@ -153,7 +184,7 @@ impl VirtualAttributions {
                     .expect("prompt lookup semaphore was closed");
 
                 crate::tokio_runtime::spawn_blocking_result(move || {
-                    Self::find_prompt_in_history_static(&repo, &missing_id)
+                    Self::find_prompt_in_history_static(&repo, &missing_id, &notes_ref)
                         .map(|(commit_sha, prompt)| (missing_id, commit_sha, prompt))
                 })
                 .await
@@ -184,14 +215,20 @@ impl VirtualAttributions {
     fn find_prompt_in_history_static(
         repo: &Repository,
         prompt_id: &str,
+        notes_ref: &AuthorshipNotesRef,
     ) -> Result<(String, crate::authorship::authorship_log::PromptRecord), GitAiError> {
         // Use git grep to search for the prompt ID in authorship notes
-        let shas = crate::git::notes_api::search_notes(repo, &format!("\"{}\"", prompt_id))
-            .unwrap_or_default();
+        let shas = crate::git::notes_api::search_notes_from_ref(
+            repo,
+            &format!("\"{}\"", prompt_id),
+            notes_ref,
+        )
+        .unwrap_or_default();
 
         // Check the most recent commit with this prompt ID
         if let Some(latest_sha) = shas.first()
-            && let Ok(log) = crate::git::notes_api::read_authorship_v3(repo, latest_sha)
+            && let Ok(log) =
+                crate::git::notes_api::read_authorship_v3_from_ref(repo, latest_sha, notes_ref)
             && let Some(prompt) = log.metadata.prompts.get(prompt_id)
         {
             return Ok((latest_sha.clone(), prompt.clone()));
@@ -207,6 +244,7 @@ impl VirtualAttributions {
     async fn load_sessions_concurrent(
         &self,
         missing_ids: &[String],
+        notes_ref: &AuthorshipNotesRef,
     ) -> Result<Vec<(String, SessionRecord)>, GitAiError> {
         const MAX_CONCURRENT: usize = 30;
 
@@ -216,6 +254,7 @@ impl VirtualAttributions {
         for missing_id in missing_ids {
             let missing_id = missing_id.clone();
             let repo = self.repo.clone();
+            let notes_ref = notes_ref.clone();
             let semaphore = Arc::clone(&semaphore);
 
             let task = async move {
@@ -224,7 +263,7 @@ impl VirtualAttributions {
                     .await
                     .expect("session lookup semaphore was closed");
                 crate::tokio_runtime::spawn_blocking_result(move || {
-                    Self::find_session_in_history_static(&repo, &missing_id)
+                    Self::find_session_in_history_static(&repo, &missing_id, &notes_ref)
                         .map(|record| (missing_id, record))
                 })
                 .await
@@ -241,13 +280,19 @@ impl VirtualAttributions {
     fn find_session_in_history_static(
         repo: &Repository,
         session_id: &str,
+        notes_ref: &AuthorshipNotesRef,
     ) -> Result<SessionRecord, GitAiError> {
         // Go through notes_api (not refs::) so the HTTP notes backend is honored.
-        let shas = crate::git::notes_api::search_notes(repo, &format!("\"{}\"", session_id))
-            .unwrap_or_default();
+        let shas = crate::git::notes_api::search_notes_from_ref(
+            repo,
+            &format!("\"{}\"", session_id),
+            notes_ref,
+        )
+        .unwrap_or_default();
 
         if let Some(latest_sha) = shas.first()
-            && let Ok(log) = crate::git::notes_api::read_authorship_v3(repo, latest_sha)
+            && let Ok(log) =
+                crate::git::notes_api::read_authorship_v3_from_ref(repo, latest_sha, notes_ref)
             && let Some(session) = log.metadata.sessions.get(session_id)
         {
             return Ok(session.clone());
@@ -960,11 +1005,33 @@ impl VirtualAttributions {
         blame_start_commit: Option<String>,
         final_state_snapshot: &HashMap<String, String>,
     ) -> Result<Self, GitAiError> {
-        let blame_va = Self::new_for_base_commit(
+        Self::from_working_log_for_commit_snapshot_in_ref(
+            repo,
+            base_commit,
+            pathspecs,
+            human_author,
+            blame_start_commit,
+            final_state_snapshot,
+            &authorship_notes_ref()?,
+        )
+        .await
+    }
+
+    pub(crate) async fn from_working_log_for_commit_snapshot_in_ref(
+        repo: Repository,
+        base_commit: String,
+        pathspecs: &[String],
+        human_author: Option<String>,
+        blame_start_commit: Option<String>,
+        final_state_snapshot: &HashMap<String, String>,
+        notes_ref: &AuthorshipNotesRef,
+    ) -> Result<Self, GitAiError> {
+        let blame_va = Self::new_for_base_commit_in_ref(
             repo.clone(),
             base_commit.clone(),
             pathspecs,
             blame_start_commit,
+            notes_ref,
         )
         .await?;
 

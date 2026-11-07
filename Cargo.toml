@@ -1,6 +1,7 @@
+# Modified by alfypops, 2026: local-only notes push option
 [package]
 name = "git-ai"
-version = "1.7.5"
+version = "1.7.5-cs.4"
 edition = "2024"
 default-run = "git-ai"
 

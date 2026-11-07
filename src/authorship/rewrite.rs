@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: pin authorship namespace throughout rewrites.
 use std::collections::{HashMap, HashSet};
 
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
@@ -5,6 +6,7 @@ use crate::authorship::hunk_shift::{DiffHunk, parse_hunk_header};
 use crate::config::Config;
 use crate::error::GitAiError;
 use crate::git::notes_api;
+use crate::git::refs::{AuthorshipNotesRef, authorship_notes_ref};
 use crate::git::repo_state::is_valid_git_oid;
 use crate::git::repository::{
     Repository, exec_git, exec_git_allow_nonzero, exec_git_stdin_streaming,
@@ -217,8 +219,9 @@ fn write_authorship_log_for_metrics(
     repo: &Repository,
     commit_sha: &str,
     log: &AuthorshipLog,
+    notes_ref: &AuthorshipNotesRef,
 ) -> Result<Option<String>, GitAiError> {
-    let serialized = write_authorship_log(repo, commit_sha, log)?;
+    let serialized = write_authorship_log(repo, commit_sha, log, notes_ref)?;
     if rewrite_metrics_enabled() {
         Ok(Some(serialized))
     } else {
@@ -416,14 +419,21 @@ pub(crate) fn handle_rewrite_event_with_metrics(
             if mappings.is_empty() {
                 return Ok(RewriteOutcome::empty());
             }
+            let notes_ref = authorship_notes_ref()?;
             let source_shas: Vec<String> =
                 mappings.iter().map(|(source, _)| source.clone()).collect();
-            crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(
+            crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort_into(
                 repo,
                 &source_shas,
+                &notes_ref,
             );
-            let shifted_notes =
-                shift_authorship_notes_merging_existing_with_notes(repo, &mappings)?;
+            let shifted_notes = shift_authorship_notes_with_existing_mode_in_ref(
+                repo,
+                &mappings,
+                true,
+                &notes_ref,
+                || {},
+            )?;
             if !rewrite_metrics_enabled() {
                 return Ok(RewriteOutcome::empty());
             }
@@ -459,13 +469,19 @@ pub(crate) fn handle_non_fast_forward_rewrite_with_operation(
     onto: Option<&str>,
     operation: RewriteMetricOperation,
 ) -> Result<RewriteOutcome, GitAiError> {
+    let notes_ref = authorship_notes_ref()?;
     let mappings = derive_mappings_from_range_diff(repo, old_tip, new_tip, onto)?;
     if mappings.is_empty() {
         return Ok(RewriteOutcome::empty());
     }
     let source_shas: Vec<String> = mappings.iter().map(|(source, _)| source.clone()).collect();
-    crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, &source_shas);
-    let shifted_notes = shift_authorship_notes_merging_existing_with_notes(repo, &mappings)?;
+    crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort_into(
+        repo,
+        &source_shas,
+        &notes_ref,
+    );
+    let shifted_notes =
+        shift_authorship_notes_with_existing_mode_in_ref(repo, &mappings, true, &notes_ref, || {})?;
     if !rewrite_metrics_enabled() {
         return Ok(RewriteOutcome::empty());
     }
@@ -483,7 +499,9 @@ fn handle_squash_merge(
 ) -> Result<RewriteOutcome, GitAiError> {
     use crate::authorship::hunk_shift::apply_hunk_shifts_to_file_attestation;
 
-    let target_notes = notes_api::read_notes_batch(repo, &[squash_commit.to_string()])?;
+    let notes_ref = authorship_notes_ref()?;
+    let target_notes =
+        notes_api::read_notes_batch_from_ref(repo, &[squash_commit.to_string()], &notes_ref)?;
     let existing_target_log = target_notes
         .get(squash_commit)
         .and_then(|raw| AuthorshipLog::deserialize_from_string(raw).ok())
@@ -497,10 +515,12 @@ fn handle_squash_merge(
         source_commits
     };
 
-    crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort(repo, &sources);
+    crate::git::sync_authorship::fetch_missing_notes_for_commits_best_effort_into(
+        repo, &sources, &notes_ref,
+    );
 
     // Batch-read all source notes in O(1) git calls
-    let source_notes_map = notes_api::read_notes_batch(repo, &sources)?;
+    let source_notes_map = notes_api::read_notes_batch_from_ref(repo, &sources, &notes_ref)?;
 
     // Collect which source commits have parseable notes and need intermediate diffs
     struct SourceNote {
@@ -534,11 +554,17 @@ fn handle_squash_merge(
         if let Some(existing_log) = existing_target_log.as_ref()
             && !repo.storage.has_working_log(onto)
         {
-            let note = write_authorship_log_for_metrics(repo, squash_commit, existing_log)?;
+            let note =
+                write_authorship_log_for_metrics(repo, squash_commit, existing_log, &notes_ref)?;
             return Ok(squash_metric_outcome(squash_commit, &sources, onto, note));
         }
-        let note =
-            post_squash_resolution_working_log(repo, onto, squash_commit, existing_target_log)?;
+        let note = post_squash_resolution_working_log(
+            repo,
+            onto,
+            squash_commit,
+            existing_target_log,
+            &notes_ref,
+        )?;
         return Ok(squash_metric_outcome(squash_commit, &sources, onto, note));
     }
 
@@ -622,11 +648,16 @@ fn handle_squash_merge(
     };
 
     if repo.storage.has_working_log(onto) {
-        let note =
-            post_squash_resolution_working_log(repo, onto, squash_commit, Some(shifted_log))?;
+        let note = post_squash_resolution_working_log(
+            repo,
+            onto,
+            squash_commit,
+            Some(shifted_log),
+            &notes_ref,
+        )?;
         Ok(squash_metric_outcome(squash_commit, &sources, onto, note))
     } else {
-        let note = write_authorship_log_for_metrics(repo, squash_commit, &shifted_log)?;
+        let note = write_authorship_log_for_metrics(repo, squash_commit, &shifted_log, &notes_ref)?;
         Ok(squash_metric_outcome(squash_commit, &sources, onto, note))
     }
 }
@@ -655,10 +686,11 @@ fn post_squash_resolution_working_log(
     onto: &str,
     squash_commit: &str,
     existing_shifted_log: Option<AuthorshipLog>,
+    notes_ref: &AuthorshipNotesRef,
 ) -> Result<Option<String>, GitAiError> {
     if !repo.storage.has_working_log(onto) {
         if let Some(log) = existing_shifted_log {
-            return write_authorship_log_for_metrics(repo, squash_commit, &log);
+            return write_authorship_log_for_metrics(repo, squash_commit, &log, notes_ref);
         }
         return Ok(None);
     }
@@ -677,6 +709,7 @@ fn post_squash_resolution_working_log(
                 recover_attribution: false,
                 commit_source: None,
             },
+            notes_ref,
             move |resolution_log| {
                 Ok(
                     crate::authorship::conflict_resolution::merge_conflict_resolution_authorship(
@@ -694,12 +727,13 @@ fn write_authorship_log(
     repo: &Repository,
     commit_sha: &str,
     log: &AuthorshipLog,
+    notes_ref: &AuthorshipNotesRef,
 ) -> Result<String, GitAiError> {
     let serialized = log.serialize_to_string().map_err(|e| {
         GitAiError::Generic(format!("failed to serialize rewrite authorship log: {}", e))
     })?;
     let entries = vec![(commit_sha.to_string(), serialized)];
-    notes_api::write_notes_batch(repo, &entries)?;
+    notes_api::write_notes_batch_to_ref(repo, &entries, notes_ref)?;
     Ok(entries
         .into_iter()
         .next()
@@ -748,6 +782,33 @@ fn shift_authorship_notes_with_existing_mode(
     mappings: &[(String, String)],
     merge_existing_targets: bool,
 ) -> Result<Vec<(String, String)>, GitAiError> {
+    shift_authorship_notes_with_existing_mode_in_ref(
+        repo,
+        mappings,
+        merge_existing_targets,
+        &authorship_notes_ref()?,
+        || {},
+    )
+}
+
+#[cfg(feature = "test-support")]
+pub fn shift_authorship_notes_with_after_read_for_test<F: FnOnce()>(
+    repo: &Repository,
+    mappings: &[(String, String)],
+    notes_ref: &AuthorshipNotesRef,
+    after_read: F,
+) -> Result<(), GitAiError> {
+    shift_authorship_notes_with_existing_mode_in_ref(repo, mappings, false, notes_ref, after_read)
+        .map(|_| ())
+}
+
+fn shift_authorship_notes_with_existing_mode_in_ref<F: FnOnce()>(
+    repo: &Repository,
+    mappings: &[(String, String)],
+    merge_existing_targets: bool,
+    notes_ref: &AuthorshipNotesRef,
+    after_read: F,
+) -> Result<Vec<(String, String)>, GitAiError> {
     tracing::debug!("shift_authorship_notes: {} mappings", mappings.len());
 
     if mappings.is_empty() {
@@ -759,7 +820,8 @@ fn shift_authorship_notes_with_existing_mode(
         .iter()
         .flat_map(|(src, dst)| [src.clone(), dst.clone()])
         .collect();
-    let notes_map = notes_api::read_notes_batch(repo, &all_shas)?;
+    let notes_map = notes_api::read_notes_batch_from_ref(repo, &all_shas, notes_ref)?;
+    after_read();
 
     // Determine which mappings need processing
     let mut pending: Vec<PendingShift> = Vec::new();
@@ -857,7 +919,7 @@ fn shift_authorship_notes_with_existing_mode(
     }
 
     // Single batched write for all notes
-    notes_api::write_notes_batch(repo, &all_writes)?;
+    notes_api::write_notes_batch_to_ref(repo, &all_writes, notes_ref)?;
 
     Ok(all_writes)
 }
@@ -2380,4 +2442,15 @@ diff --git a/c.txt b/c.txt
             assert!(merged.metadata.humans.contains_key(&format!("h_{index}")));
         }
     }
+}
+
+#[cfg(feature = "test-support")]
+pub fn derive_merge_commit_mappings_for_test(
+    repo: &Repository,
+    base: &str,
+    old_tip: &str,
+    new_tip: &str,
+    existing_mappings: &[(String, String)],
+) -> Result<Vec<(String, String)>, GitAiError> {
+    derive_merge_commit_mappings(repo, base, old_tip, new_tip, existing_mappings)
 }

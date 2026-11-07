@@ -1,0 +1,8 @@
+# Modified by alfypops, 2026: point vulnerability and upstream reports to the right place
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/alfypops/git-ai/security/advisories/new
+    about: Report vulnerabilities privately. Never open a public issue for one.
+  - name: Problems in upstream git-ai
+    url: https://github.com/git-ai-project/git-ai/issues
+    about: If the problem also happens with upstream git-ai, report it upstream.

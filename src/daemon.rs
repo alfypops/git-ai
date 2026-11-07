@@ -1,3 +1,6 @@
+// Modified by alfypops, 2026: configured authorship ref in daemon test fixture.
+// Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: ignore trace roots outside daemon_repo_roots.
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::checkpoint_content_budget::CheckpointContentBudget;
 use crate::config;
@@ -552,6 +555,34 @@ fn daemon_worktree_from_repo_path(repo_path: &Path) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// `path` with its longest existing prefix canonicalized and the rest (not yet
+/// created) appended as given.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            return missing
+                .iter()
+                .rev()
+                .fold(canonical, |acc, name| acc.join(name));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The repository family key for a worktree: its canonicalized common dir.
+fn canonical_common_dir_for_worktree(worktree: &Path) -> Option<PathBuf> {
+    common_dir_for_worktree(worktree)
+        .map(|common_dir| common_dir.canonicalize().unwrap_or(common_dir))
 }
 
 fn trace_payload_worktree_hint(payload: &Value) -> Option<PathBuf> {
@@ -1337,7 +1368,7 @@ fn apply_push_side_effect(
     crate::commands::upgrade::maybe_schedule_background_update_check();
     tracing::debug!("started pushing authorship notes to remote: {}", remote);
 
-    push_authorship_notes(&repo, &remote)
+    push_authorship_notes(&repo, &remote).map(|_| ())
 }
 
 fn transcript_sweep_triggers_for_events(
@@ -3134,6 +3165,12 @@ pub struct ActorDaemonCoordinator {
     // trip proves accept → reader spawn → read → parse is still draining.
     next_trace_drain_probe_id: AtomicU64,
     observed_trace_drain_probe_id: AtomicU64,
+    // Trace roots and checkpoints dropped because their repository is outside
+    // `daemon_repo_roots` (deliberate, so not loss accounting).
+    outside_repo_roots_ignored: AtomicU64,
+    // Trace roots ignored by `daemon_repo_roots` whose own connection is still
+    // open, so child processes' connections drop their frames too.
+    ignored_trace_roots: Mutex<HashSet<String>>,
     // Loss accounting: attribution loss must be loud, never silent. Trace
     // payloads dropped on a full ingest queue and trace connections dropped
     // before a reader could serve them both mean lost attribution for the
@@ -3286,6 +3323,8 @@ impl ActorDaemonCoordinator {
             trace_ingress_state: Mutex::new(TraceIngressState::default()),
             next_trace_drain_probe_id: AtomicU64::new(0),
             observed_trace_drain_probe_id: AtomicU64::new(0),
+            outside_repo_roots_ignored: AtomicU64::new(0),
+            ignored_trace_roots: Mutex::new(HashSet::new()),
             trace_payloads_dropped_queue_full: AtomicU64::new(0),
             trace_connections_dropped: AtomicU64::new(0),
             checkpoints_dropped: AtomicU64::new(0),
@@ -4450,6 +4489,44 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    /// Counts trace roots and checkpoints ignored by `daemon_repo_roots`. No
+    /// info or error log: only a debug line each time the count crosses a power
+    /// of two.
+    fn record_outside_repo_roots_ignored(&self, ignored: u64) {
+        if ignored == 0 {
+            return;
+        }
+        let before = self
+            .outside_repo_roots_ignored
+            .fetch_add(ignored, Ordering::Relaxed);
+        let after = before + ignored;
+        if before == 0 || after.ilog2() > before.ilog2() {
+            tracing::debug!(
+                ignored = after,
+                "ignoring work for repositories outside daemon_repo_roots"
+            );
+        }
+    }
+
+    fn trace_root_is_ignored(&self, root_sid: &str) -> bool {
+        self.ignored_trace_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(root_sid)
+    }
+
+    fn set_trace_root_ignored(&self, root_sid: &str, ignored: bool) {
+        let mut roots = self
+            .ignored_trace_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ignored {
+            roots.insert(root_sid.to_string());
+        } else {
+            roots.remove(root_sid);
+        }
+    }
+
     fn trace_root_connection_opened(&self, root_sid: &str) -> Result<(), GitAiError> {
         let mut ingress = self
             .trace_ingress_state
@@ -4877,7 +4954,7 @@ impl ActorDaemonCoordinator {
                 let prepare = coordinator.prepare_checkpoint_admission(accepted);
                 let caught = std::panic::AssertUnwindSafe(prepare);
                 match futures::FutureExt::catch_unwind(caught).await {
-                    Ok(Ok(prepared)) => {
+                    Ok(Ok(Some(prepared))) => {
                         if let Err(error) = coordinator.complete_checkpoint_admission(prepared) {
                             tracing::error!(
                                 component = "daemon",
@@ -4891,15 +4968,19 @@ impl ActorDaemonCoordinator {
                             break;
                         }
                     }
-                    Ok(Err(error)) => {
-                        tracing::error!(
-                            component = "daemon",
-                            phase = "checkpoint_admission",
-                            reason = "checkpoint_prepare_failed",
-                            receipt_seq,
-                            %error,
-                            "failed preparing accepted checkpoint"
-                        );
+                    // Not admitted: a failed prepare, or a repository outside
+                    // `daemon_repo_roots`. Either way, release its receipt.
+                    Ok(outcome) => {
+                        if let Err(error) = outcome {
+                            tracing::error!(
+                                component = "daemon",
+                                phase = "checkpoint_admission",
+                                reason = "checkpoint_prepare_failed",
+                                receipt_seq,
+                                %error,
+                                "failed preparing accepted checkpoint"
+                            );
+                        }
                         if let Err(accounting_error) =
                             coordinator.complete_failed_checkpoint_admission(receipt_seq)
                         {
@@ -4946,10 +5027,12 @@ impl ActorDaemonCoordinator {
         Ok(())
     }
 
+    /// Returns `None` for a checkpoint in a repository outside
+    /// `daemon_repo_roots`: it is released without any side effect.
     async fn prepare_checkpoint_admission(
         &self,
         accepted: AcceptedCheckpoint,
-    ) -> Result<PreparedCheckpointAdmission, GitAiError> {
+    ) -> Result<Option<PreparedCheckpointAdmission>, GitAiError> {
         let request: CheckpointRequest =
             serde_json::from_slice(&accepted.body).map_err(|error| {
                 GitAiError::Generic(format!("invalid accepted checkpoint body: {error}"))
@@ -4969,6 +5052,12 @@ impl ActorDaemonCoordinator {
             ));
         };
         let family = self.backend.resolve_family(&repo_work_dir)?.0;
+        // The managed hooks only checkpoint managed repositories; the daemon
+        // enforces the allow-list anyway, with the same matcher as the trace gate.
+        if !config::Config::daemon_repo_roots_cached().allows(Path::new(&family)) {
+            self.record_outside_repo_roots_ignored(1);
+            return Ok(None);
+        }
         crate::wltrace::wltrace("checkpoint.admission", Path::new(&family), || {
             format!(
                 "receipt_seq={} repo_work_dir={}",
@@ -4998,13 +5087,13 @@ impl ActorDaemonCoordinator {
             "checkpoint prepared for family admission"
         );
 
-        Ok(PreparedCheckpointAdmission {
+        Ok(Some(PreparedCheckpointAdmission {
             receipt_seq: accepted.receipt_seq,
             received_at_ns: accepted.received_at_ns,
             family,
             request,
             reservation: accepted.reservation,
-        })
+        }))
     }
 
     fn notify_checkpoint_stream(&self, request: &CheckpointRequest) {
@@ -5359,10 +5448,8 @@ impl ActorDaemonCoordinator {
         let resolved_family = worktree_hint.as_ref().and_then(|worktree| {
             #[cfg(feature = "test-support")]
             maybe_stall_family_resolution_for_test(worktree);
-            common_dir_for_worktree(worktree).map(|common_dir| {
-                let family = common_dir.canonicalize().unwrap_or(common_dir);
-                family.to_string_lossy().to_string()
-            })
+            canonical_common_dir_for_worktree(worktree)
+                .map(|family| family.to_string_lossy().to_string())
         });
 
         let mut ingress = match self.trace_ingress_state.lock() {
@@ -5674,14 +5761,15 @@ impl ActorDaemonCoordinator {
             .await?;
         if maintenance {
             // Rows for repositories the fixup now ignores (scratch repos from
-            // before this rule, or newly configured globs) are forgotten here.
+            // before this rule, newly configured globs, families outside
+            // `daemon_repo_roots`) are forgotten here.
             let ignore = self.untraced_fixup_ignore()?;
             if let Some(count) = self
                 .with_repo_family_store(move |store| {
                     let forgotten: Vec<String> = store
                         .known_families(true)?
                         .into_iter()
-                        .filter(|family| ignore.ignores(family))
+                        .filter(|family| ignore.forgets(family))
                         .collect();
                     store.forget_families(&forgotten)?;
                     store.prune(now_secs)?;
@@ -5957,13 +6045,18 @@ impl ActorDaemonCoordinator {
         }))
     }
 
-    /// A snapshot of the fixup's ignore rules (cheap: a few paths and globs).
+    /// A snapshot of the fixup's ignore rules (cheap: a few paths and globs),
+    /// with the current `daemon_repo_roots`.
     fn untraced_fixup_ignore(
         &self,
     ) -> Result<crate::daemon::untraced_fixup_ignore::UntracedFixupIgnore, GitAiError> {
         self.untraced_fixup_ignore
             .lock()
-            .map(|ignore| ignore.clone())
+            .map(|ignore| {
+                ignore
+                    .clone()
+                    .with_repo_roots(config::Config::daemon_repo_roots_cached())
+            })
             .map_err(|_| GitAiError::Generic("untraced fixup ignore lock poisoned".to_string()))
     }
 
@@ -9857,10 +9950,16 @@ fn handle_trace_connection_actor_reader<R: Read>(
     coordinator: Arc<ActorDaemonCoordinator>,
     mut observed_roots: std::collections::BTreeSet<String>,
 ) -> Result<(), GitAiError> {
+    let mut repo_gate = TraceRepoGate::new(Box::new(config::Config::daemon_repo_roots_cached));
     let read_result = (|| {
         while let Some(line) = read_json_line(&mut reader)? {
-            if process_trace_connection_line(&line, coordinator.clone(), &mut observed_roots)?
-                .is_some_and(|outcome| !outcome.continue_reading)
+            if process_trace_connection_line(
+                &line,
+                coordinator.clone(),
+                &mut observed_roots,
+                &mut repo_gate,
+            )?
+            .is_some_and(|outcome| !outcome.continue_reading)
             {
                 break;
             }
@@ -9871,6 +9970,7 @@ fn handle_trace_connection_actor_reader<R: Read>(
     // Close bookkeeping must run no matter how the read loop ended (EOF,
     // invalid UTF-8, connection reset): a root left registered as open blocks
     // this family's sequencer and checkpoint fences forever.
+    repo_gate.finish(&coordinator);
     let finalize_result = finalize_trace_connection_roots(coordinator, observed_roots);
     read_result.and(finalize_result)
 }
@@ -9898,10 +9998,176 @@ fn raw_trace_event_type(line: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// A connection's `daemon_repo_roots` decisions, made once per trace root.
+/// With no list every frame passes straight through. With one, a root's
+/// frames are held until one of them names a repository, then replayed if
+/// its canonical common dir is under a listed root or dropped otherwise. A
+/// dropped root never reaches ingress bookkeeping, so it can't hold a fence.
+/// Like ingress, clone/init roots are decided by their `def_repo` (the target
+/// repository), not by the directory they were invoked from. Each git process
+/// has its own connection, so a child process is decided by its own repo,
+/// unless its root was already ignored on the root's own connection: then the
+/// child is dropped too, so it can't open the root's fence on its own.
+///
+/// Known race (accepted): the ignore is shared only once the root's reader
+/// has decided it. For a root other than clone/init (decided at its first
+/// hinted frame, normally `def_repo`, before any child is spawned), a child
+/// whose frames another reader thread handles within that millisecond window
+/// is decided by its own repository instead. clone/init are decided at
+/// `def_repo` from the target path, before their children start.
+struct TraceRepoGate {
+    load_roots: Box<dyn Fn() -> Arc<config::DaemonRepoRoots>>,
+    admitted: HashSet<String>,
+    ignored: HashSet<String>,
+    pending: HashMap<String, (Arc<config::DaemonRepoRoots>, Vec<Value>)>,
+    /// Roots this connection ignored from their own frames, shared with other
+    /// connections through the coordinator until this one closes.
+    published: Vec<String>,
+}
+
+impl TraceRepoGate {
+    fn new(load_roots: Box<dyn Fn() -> Arc<config::DaemonRepoRoots>>) -> Self {
+        Self {
+            load_roots,
+            admitted: HashSet::new(),
+            ignored: HashSet::new(),
+            pending: HashMap::new(),
+            published: Vec::new(),
+        }
+    }
+
+    /// Returns the frames to ingest now, in arrival order.
+    fn admit(&mut self, frame: Value, coordinator: &ActorDaemonCoordinator) -> Vec<Value> {
+        let Some(sid) = frame.get("sid").and_then(Value::as_str) else {
+            return vec![frame];
+        };
+        let root = trace_root_sid(sid).to_string();
+        let is_root_frame = sid == root;
+        if self.admitted.contains(&root) {
+            return vec![frame];
+        }
+        if self.ignored.contains(&root) {
+            return Vec::new();
+        }
+        let roots = match self.pending.get(&root) {
+            Some((roots, _)) => roots.clone(),
+            None => (self.load_roots)(),
+        };
+        if !roots.is_active() {
+            self.admitted.insert(root);
+            return vec![frame];
+        }
+        if !is_root_frame && coordinator.trace_root_is_ignored(&root) {
+            self.pending.remove(&root);
+            self.ignored.insert(root);
+            return Vec::new();
+        }
+        let argv = if frame.get("event").and_then(Value::as_str) == Some("start") {
+            trace_payload_argv(&frame)
+        } else {
+            self.pending
+                .get(&root)
+                .and_then(|(_, held)| {
+                    held.iter()
+                        .find(|held| held.get("event").and_then(Value::as_str) == Some("start"))
+                })
+                .map(trace_payload_argv)
+                .unwrap_or_default()
+        };
+        let common_dir = if trace_command_uses_target_repo_context_only(
+            trace_argv_primary_command(&argv).as_deref(),
+        ) {
+            Self::target_common_dir(&frame, &argv, coordinator)
+        } else {
+            Self::frame_common_dir(&frame)
+        };
+        let Some(common_dir) = common_dir else {
+            self.pending
+                .entry(root)
+                .or_insert_with(|| (roots, Vec::new()))
+                .1
+                .push(frame);
+            return Vec::new();
+        };
+        let mut frames = self
+            .pending
+            .remove(&root)
+            .map(|(_, held)| held)
+            .unwrap_or_default();
+        if roots.allows(&common_dir) {
+            frames.push(frame);
+            self.admitted.insert(root);
+            return frames;
+        }
+        if is_root_frame {
+            coordinator.set_trace_root_ignored(&root, true);
+            self.published.push(root.clone());
+        }
+        self.ignored.insert(root);
+        coordinator.record_outside_repo_roots_ignored(1);
+        Vec::new()
+    }
+
+    /// The canonical common dir of the existing repository a frame names.
+    fn frame_common_dir(frame: &Value) -> Option<PathBuf> {
+        trace_payload_worktree_hint(frame)
+            .filter(|worktree| worktree.is_absolute())
+            .and_then(|worktree| canonical_common_dir_for_worktree(&worktree))
+    }
+
+    /// clone/init name a target repository that isn't complete yet, so its
+    /// common dir comes from the path: the `def_repo` worktree's `.git`, the
+    /// `--separate-git-dir`, or a `--bare` target from argv. Deciding here,
+    /// before any child process starts, lets an ignore reach the children.
+    fn target_common_dir(
+        frame: &Value,
+        argv: &[String],
+        coordinator: &ActorDaemonCoordinator,
+    ) -> Option<PathBuf> {
+        let separate_git_dir = argv.iter().enumerate().find_map(|(idx, arg)| {
+            match arg.strip_prefix("--separate-git-dir=") {
+                Some(dir) => Some(dir.to_string()),
+                None if arg == "--separate-git-dir" => argv.get(idx + 1).cloned(),
+                None => None,
+            }
+        });
+        if let Some(dir) = separate_git_dir.map(PathBuf::from) {
+            return dir
+                .is_absolute()
+                .then(|| canonicalize_existing_prefix(&dir));
+        }
+        if argv.iter().any(|arg| arg == "--bare" || arg == "--mirror") {
+            let target = match trace_argv_primary_command(argv).as_deref() {
+                Some("clone") => coordinator.backend.clone_target(argv, None),
+                _ => coordinator.backend.init_target(argv, None),
+            }?;
+            return Some(canonicalize_existing_prefix(&target));
+        }
+        if frame.get("event").and_then(Value::as_str) != Some("def_repo") {
+            return None;
+        }
+        let worktree = PathBuf::from(frame.get("worktree")?.as_str()?);
+        worktree
+            .is_absolute()
+            .then(|| canonicalize_existing_prefix(&worktree).join(".git"))
+    }
+
+    /// Roots still undecided when the connection ends never named a listed
+    /// repository, so their held frames are dropped (fail closed). Roots this
+    /// connection ignored are forgotten: their process has exited.
+    fn finish(self, coordinator: &ActorDaemonCoordinator) {
+        coordinator.record_outside_repo_roots_ignored(self.pending.len() as u64);
+        for root in &self.published {
+            coordinator.set_trace_root_ignored(root, false);
+        }
+    }
+}
+
 fn process_trace_connection_line(
     line: &str,
     coordinator: Arc<ActorDaemonCoordinator>,
     observed_roots: &mut std::collections::BTreeSet<String>,
+    repo_gate: &mut TraceRepoGate,
 ) -> Result<Option<TraceLineOutcome>, GitAiError> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -9913,7 +10179,7 @@ fn process_trace_connection_line(
     {
         return Ok(None);
     }
-    let mut parsed: Value = match serde_json::from_str(trimmed) {
+    let parsed: Value = match serde_json::from_str(trimmed) {
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
@@ -9937,24 +10203,37 @@ fn process_trace_connection_line(
     if !reader_should_ingest_trace_event(event) {
         return Ok(None);
     }
-    if let Some(sid) = parsed.get("sid").and_then(Value::as_str) {
-        let was_unidentified = observed_roots.is_empty();
-        let root_sid = trace_root_sid(sid).to_string();
-        if observed_roots.insert(root_sid.clone()) {
-            let _ = coordinator.trace_root_connection_opened(&root_sid);
+    let frames = repo_gate.admit(parsed, &coordinator);
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    for mut parsed in frames {
+        if let Some(sid) = parsed.get("sid").and_then(Value::as_str) {
+            let was_unidentified = observed_roots.is_empty();
+            let root_sid = trace_root_sid(sid).to_string();
+            if observed_roots.insert(root_sid.clone()) {
+                let _ = coordinator.trace_root_connection_opened(&root_sid);
+            }
+            if was_unidentified {
+                coordinator.trace_unidentified_connection_identified_or_closed()?;
+            }
         }
-        if was_unidentified {
-            coordinator.trace_unidentified_connection_identified_or_closed()?;
+        // Only enqueue payloads for mutating commands.  Read-only invocations
+        // (status, diff, stash list, worktree list, …) are handled inline by
+        // prepare_trace_payload_for_ingest and must not enter the serial ingest
+        // queue — doing so causes the >1-minute backlog seen with IDEs that
+        // issue dozens of read-only git commands per second.
+        if coordinator.prepare_trace_payload_for_ingest(&mut parsed)
+            && coordinator.enqueue_trace_payload(parsed).is_err()
+        {
+            return Ok(Some(TraceLineOutcome {
+                continue_reading: false,
+            }));
         }
     }
-    // Only enqueue payloads for mutating commands.  Read-only invocations
-    // (status, diff, stash list, worktree list, …) are handled inline by
-    // prepare_trace_payload_for_ingest and must not enter the serial ingest
-    // queue — doing so causes the >1-minute backlog seen with IDEs that
-    // issue dozens of read-only git commands per second.
-    let continue_reading = !(coordinator.prepare_trace_payload_for_ingest(&mut parsed)
-        && coordinator.enqueue_trace_payload(parsed).is_err());
-    Ok(Some(TraceLineOutcome { continue_reading }))
+    Ok(Some(TraceLineOutcome {
+        continue_reading: true,
+    }))
 }
 
 fn finalize_trace_connection_roots(
@@ -10695,6 +10974,11 @@ pub(crate) async fn run_daemon(config: DaemonConfig) -> Result<DaemonExitAction,
     }
 
     let _log_guard = maybe_setup_daemon_log_file(&config);
+
+    // Pin successful and failed namespace configuration before accepting work.
+    if let Err(error) = crate::git::refs::authorship_notes_ref() {
+        tracing::warn!(%error, "authorship disabled until daemon restart");
+    }
 
     tracing::info!(
         pid = std::process::id(),
@@ -11707,7 +11991,14 @@ mod tests {
             &["mktree"],
             &format!("040000 tree {leaf_tree}\t{prefix}\n"),
         );
-        run_git_for_test(&repo_path, &["update-ref", "refs/notes/ai", &root_tree]);
+        run_git_for_test(
+            &repo_path,
+            &[
+                "update-ref",
+                &crate::git::refs::authorship_notes_ref().unwrap().full,
+                &root_tree,
+            ],
+        );
 
         let repo = crate::git::find_repository_in_path(repo_path.to_str().unwrap())
             .expect("find test repository");
@@ -13801,6 +14092,7 @@ mod tests {
             r#"{"event":"data","sid":"noise-root","category":"index","label":"x"}"#,
             coord.clone(),
             &mut observed_roots,
+            &mut repo_gate_for(json!([])),
         )
         .unwrap();
 
@@ -13814,6 +14106,451 @@ mod tests {
             ingress.root_last_activity_ns.is_empty(),
             "noise frames must not touch ingress bookkeeping"
         );
+    }
+
+    fn repo_gate_for(roots: Value) -> TraceRepoGate {
+        let (roots, errors) = config::parse_daemon_repo_roots(Some(&roots));
+        assert!(errors.is_empty(), "{errors:?}");
+        let roots = Arc::new(roots);
+        TraceRepoGate::new(Box::new(move || roots.clone()))
+    }
+
+    fn feed_trace_frames(
+        coord: &Arc<ActorDaemonCoordinator>,
+        observed_roots: &mut std::collections::BTreeSet<String>,
+        repo_gate: &mut TraceRepoGate,
+        frames: &[Value],
+    ) {
+        for frame in frames {
+            process_trace_connection_line(
+                &frame.to_string(),
+                coord.clone(),
+                observed_roots,
+                repo_gate,
+            )
+            .unwrap();
+        }
+    }
+
+    /// `start` carries no repository hint (no `-C`); `def_repo` names it.
+    fn commit_start_frame(sid: &str) -> Value {
+        json!({ "event": "start", "sid": sid, "argv": ["git", "commit", "-m", "x"], "time_ns": 1u64 })
+    }
+
+    fn def_repo_frame(sid: &str, worktree: &Path) -> Value {
+        json!({ "event": "def_repo", "sid": sid, "worktree": worktree, "time_ns": 2u64 })
+    }
+
+    fn ingress_knows_root(coord: &ActorDaemonCoordinator, sid: &str) -> bool {
+        let ingress = coord.trace_ingress_state.lock().unwrap();
+        ingress.root_open_connections.contains_key(sid)
+            || ingress.root_last_activity_ns.contains_key(sid)
+            || ingress.root_argv.contains_key(sid)
+            || ingress.root_families.contains_key(sid)
+    }
+
+    #[tokio::test]
+    async fn unlisted_root_is_dropped_before_any_bookkeeping_and_leaves_no_fence() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, _) = init_test_family(&coord, &temp);
+        run_git_for_test(temp.path(), &["init", "unlisted"]);
+        let unlisted = temp.path().join("unlisted");
+        let mut repo_gate = repo_gate_for(json!([listed]));
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let sid = "20260411T120000.000000-Psid-unlisted";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[commit_start_frame(sid), def_repo_frame(sid, &unlisted)],
+        );
+
+        assert!(!ingress_knows_root(&coord, sid));
+        assert!(observed_roots.is_empty());
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 0);
+        assert!(!coord.has_open_trace_roots_that_may_mutate_refs());
+        assert_eq!(coord.outside_repo_roots_ignored.load(Ordering::Relaxed), 1);
+
+        // Later frames of the decided root drop cheaply, counted once per root.
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[json!({ "event": "atexit", "sid": sid, "code": 0, "time_ns": 3u64 })],
+        );
+        assert!(!ingress_knows_root(&coord, sid));
+        assert_eq!(coord.outside_repo_roots_ignored.load(Ordering::Relaxed), 1);
+        finalize_trace_connection_roots(coord.clone(), observed_roots).unwrap();
+        assert!(!coord.has_open_trace_roots_that_may_mutate_refs());
+    }
+
+    #[tokio::test]
+    async fn listed_root_after_unlisted_root_on_one_connection_is_ingested_on_its_hint() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, family) = init_test_family(&coord, &temp);
+        run_git_for_test(temp.path(), &["init", "unlisted"]);
+        let unlisted = temp.path().join("unlisted");
+        let mut repo_gate = repo_gate_for(json!([listed]));
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let ignored_sid = "20260411T120000.000000-Psid-unlisted-first";
+        let listed_sid = "20260411T120000.000000-Psid-listed-second";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[
+                commit_start_frame(ignored_sid),
+                def_repo_frame(ignored_sid, &unlisted),
+                commit_start_frame(listed_sid),
+                def_repo_frame(listed_sid, &listed),
+            ],
+        );
+
+        assert!(!ingress_knows_root(&coord, ignored_sid));
+        assert_eq!(
+            observed_roots.iter().cloned().collect::<Vec<_>>(),
+            vec![listed_sid.to_string()]
+        );
+        {
+            let ingress = coord.trace_ingress_state.lock().unwrap();
+            assert_eq!(ingress.root_families.get(listed_sid), Some(&family));
+            assert!(ingress.root_argv.contains_key(listed_sid));
+        }
+        assert!(coord.has_open_trace_roots_that_may_mutate_family(&family));
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn frames_before_the_repository_hint_wait_for_the_decision() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, _) = init_test_family(&coord, &temp);
+        let mut repo_gate = repo_gate_for(json!([listed]));
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let sid = "20260411T120000.000000-Psid-hint-later";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[commit_start_frame(sid)],
+        );
+        assert!(!ingress_knows_root(&coord, sid));
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 0);
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[def_repo_frame(sid, &listed)],
+        );
+        let ingress = coord.trace_ingress_state.lock().unwrap();
+        assert!(ingress.root_argv.contains_key(sid), "held start replayed");
+        assert!(ingress.root_started_at_ns.contains_key(sid));
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test]
+    async fn clone_roots_are_decided_by_their_target_repository() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, _) = init_test_family(&coord, &temp);
+        run_git_for_test(temp.path(), &["init", "unlisted"]);
+        let unlisted = temp.path().join("unlisted");
+        let mut repo_gate = repo_gate_for(json!([listed]));
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let clone_start = |sid: &str, from: &Path, into: &Path| {
+            json!({
+                "event": "start",
+                "sid": sid,
+                "argv": ["git", "-C", from, "clone", "https://example.com/r.git", into],
+                "time_ns": 1u64,
+            })
+        };
+        let into_listed = "20260411T120000.000000-Psid-clone-into-listed";
+        let into_unlisted = "20260411T120000.000000-Psid-clone-into-unlisted";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[
+                clone_start(into_listed, &unlisted, &listed),
+                def_repo_frame(into_listed, &listed),
+                clone_start(into_unlisted, &listed, &unlisted),
+                def_repo_frame(into_unlisted, &unlisted),
+            ],
+        );
+
+        let ingress = coord.trace_ingress_state.lock().unwrap();
+        assert!(ingress.root_argv.contains_key(into_listed));
+        drop(ingress);
+        assert!(!ingress_knows_root(&coord, into_unlisted));
+    }
+
+    fn clone_start_frame(sid: &str, target: &Path) -> Value {
+        json!({
+            "event": "start",
+            "sid": sid,
+            "argv": ["git", "clone", "https://example.com/r.git", target],
+            "time_ns": 1u64,
+        })
+    }
+
+    #[test]
+    fn canonicalize_existing_prefix_resolves_the_existing_part_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().canonicalize().unwrap();
+        assert_eq!(canonicalize_existing_prefix(temp.path()), real);
+        assert_eq!(
+            canonicalize_existing_prefix(&temp.path().join("new/deeper")),
+            real.join("new").join("deeper")
+        );
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(real.join("target-dir")).unwrap();
+            std::os::unix::fs::symlink(real.join("target-dir"), real.join("link")).unwrap();
+            assert_eq!(
+                canonicalize_existing_prefix(&temp.path().join("link/new")),
+                real.join("target-dir").join("new")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_and_init_targets_resolve_from_argv_and_def_repo() {
+        let coord = ActorDaemonCoordinator::new();
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().canonicalize().unwrap();
+        let target = temp.path().join("x");
+        let separate = temp.path().join("separate.git");
+        let argv = |args: &[&str]| -> Vec<String> {
+            std::iter::once("git")
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect()
+        };
+        let target_str = target.to_str().unwrap();
+        let separate_str = separate.to_str().unwrap();
+        let start = json!({ "event": "start", "sid": "s" });
+        let def_repo = def_repo_frame("s", &target);
+        let resolve = |frame: &Value, args: &[&str]| {
+            TraceRepoGate::target_common_dir(frame, &argv(args), &coord)
+        };
+
+        // Plain clone: the def_repo worktree's `.git`; `start` names nothing.
+        let plain = ["clone", "https://example.com/r.git", target_str];
+        assert_eq!(
+            resolve(&def_repo, &plain),
+            Some(real.join("x").join(".git"))
+        );
+        assert_eq!(resolve(&start, &plain), None);
+
+        // --separate-git-dir, in both spellings: the git dir it names.
+        for args in [
+            vec![
+                "clone",
+                "--separate-git-dir",
+                separate_str,
+                "https://example.com/r.git",
+                target_str,
+            ],
+            vec![
+                "init",
+                &format!("--separate-git-dir={separate_str}"),
+                target_str,
+            ],
+        ] {
+            assert_eq!(
+                resolve(&def_repo, &args),
+                Some(real.join("separate.git")),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            resolve(
+                &def_repo,
+                &["clone", "--separate-git-dir", "rel.git", "u", target_str]
+            ),
+            None,
+            "a relative separate git dir can't be placed"
+        );
+
+        // --bare / --mirror emit no def_repo: the argv target is the git dir.
+        for args in [
+            vec!["clone", "--bare", "https://example.com/r.git", target_str],
+            vec!["clone", "--mirror", "https://example.com/r.git", target_str],
+            vec!["init", "--bare", target_str],
+        ] {
+            assert_eq!(resolve(&start, &args), Some(real.join("x")), "{args:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_is_decided_at_def_repo_before_its_repository_exists() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let clones = temp.path().join("clones");
+        fs::create_dir_all(&clones).unwrap();
+        let target = clones.join("new");
+        let mut repo_gate = repo_gate_for(json!([clones]));
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let sid = "20260411T120000.000000-Psid-clone-before-head";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[
+                clone_start_frame(sid, &target),
+                def_repo_frame(sid, &target),
+            ],
+        );
+
+        let ingress = coord.trace_ingress_state.lock().unwrap();
+        assert!(ingress.root_argv.contains_key(sid), "admitted at def_repo");
+    }
+
+    /// The measured order for `git clone file://<listed> <unlisted>`: the
+    /// root's `def_repo` (target not created yet), then a child in the listed
+    /// source on its own connection, then the root's `exit`.
+    #[tokio::test]
+    async fn ignored_clone_drops_its_children_in_the_listed_source() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, family) = init_test_family(&coord, &temp);
+        let target = temp.path().join("scratch").join("x");
+        let root = "20260411T120000.000000-Psid-clone-from-listed";
+        let child = format!("{root}/20260411T120000.000001-Psid-pack-objects");
+        let mut root_gate = repo_gate_for(json!([listed]));
+        let mut root_observed = std::collections::BTreeSet::new();
+        let mut child_gate = repo_gate_for(json!([listed]));
+        let mut child_observed = std::collections::BTreeSet::new();
+
+        feed_trace_frames(
+            &coord,
+            &mut root_observed,
+            &mut root_gate,
+            &[
+                clone_start_frame(root, &target),
+                def_repo_frame(root, &target),
+            ],
+        );
+        feed_trace_frames(
+            &coord,
+            &mut child_observed,
+            &mut child_gate,
+            &[
+                json!({ "event": "start", "sid": child, "argv": ["git", "pack-objects"], "time_ns": 2u64 }),
+                def_repo_frame(&child, &listed),
+            ],
+        );
+
+        assert!(!ingress_knows_root(&coord, root));
+        assert!(!coord.has_open_trace_roots_that_may_mutate_family(&family));
+        feed_trace_frames(
+            &coord,
+            &mut root_observed,
+            &mut root_gate,
+            &[json!({ "event": "exit", "sid": root, "code": 0, "time_ns": 3u64 })],
+        );
+        assert!(!ingress_knows_root(&coord, root));
+    }
+
+    #[tokio::test]
+    async fn child_connection_of_an_ignored_root_is_dropped_too() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, _) = init_test_family(&coord, &temp);
+        run_git_for_test(temp.path(), &["init", "unlisted"]);
+        let unlisted = temp.path().join("unlisted");
+        let root = "20260411T120000.000000-Psid-ignored-parent";
+        let child = format!("{root}/20260411T120000.000001-Psid-child");
+
+        // The root's own connection ignores it...
+        let mut root_gate = repo_gate_for(json!([listed]));
+        let mut root_observed = std::collections::BTreeSet::new();
+        feed_trace_frames(
+            &coord,
+            &mut root_observed,
+            &mut root_gate,
+            &[commit_start_frame(root), def_repo_frame(root, &unlisted)],
+        );
+        // ...so a child git working in the listed repo, on its own
+        // connection, must not open that root.
+        let mut child_gate = repo_gate_for(json!([listed]));
+        let mut child_observed = std::collections::BTreeSet::new();
+        feed_trace_frames(
+            &coord,
+            &mut child_observed,
+            &mut child_gate,
+            &[commit_start_frame(&child), def_repo_frame(&child, &listed)],
+        );
+
+        assert!(!ingress_knows_root(&coord, root));
+        assert!(child_observed.is_empty());
+        assert!(!coord.has_open_trace_roots_that_may_mutate_refs());
+
+        root_gate.finish(&coord);
+        assert!(
+            !coord.trace_root_is_ignored(root),
+            "forgotten once the root's connection closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_without_a_resolvable_hint_is_dropped_and_counted_at_close() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let (listed, _) = init_test_family(&coord, &temp);
+        let mut repo_gate = repo_gate_for(json!([listed]));
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let sid = "20260411T120000.000000-Psid-never-hinted";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate,
+            &[commit_start_frame(sid)],
+        );
+        repo_gate.finish(&coord);
+        finalize_trace_connection_roots(coord.clone(), observed_roots).unwrap();
+
+        assert!(!ingress_knows_root(&coord, sid));
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 0);
+        assert_eq!(coord.outside_repo_roots_ignored.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn without_repo_roots_frames_are_ingested_as_they_arrive() {
+        let coord = Arc::new(ActorDaemonCoordinator::new());
+        coord.start_trace_ingest_worker().unwrap();
+        let mut observed_roots = std::collections::BTreeSet::new();
+        let sid = "20260411T120000.000000-Psid-no-list";
+
+        feed_trace_frames(
+            &coord,
+            &mut observed_roots,
+            &mut repo_gate_for(json!([])),
+            &[commit_start_frame(sid)],
+        );
+
+        let ingress = coord.trace_ingress_state.lock().unwrap();
+        assert!(ingress.root_open_connections.contains_key(sid));
+        assert!(ingress.root_argv.contains_key(sid));
+        assert_eq!(coord.next_trace_ingest_seq.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test]
@@ -13833,6 +14570,7 @@ mod tests {
             r#"{"event":"git_ai_drain_probe","git_ai_probe_id":7}"#,
             coord.clone(),
             &mut observed_roots,
+            &mut repo_gate_for(json!([])),
         )
         .unwrap()
         .expect("probe frame should produce an outcome");
@@ -14492,4 +15230,13 @@ mod tests {
         }
         coord.request_shutdown();
     }
+}
+
+#[cfg(feature = "test-support")]
+pub fn process_conflict_resolution_working_logs_for_test(
+    repo: &Repository,
+    new_tip: &str,
+    onto: &str,
+) -> Result<(), GitAiError> {
+    process_conflict_resolution_working_logs(repo, new_tip, Some(onto)).map(|_| ())
 }

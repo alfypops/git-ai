@@ -1,3 +1,4 @@
+//! Modified by alfypops, 2026: credit Bash edits made inside the mtime grace window of the previous checkpoint by stat-tuple change.
 //! Bash tool change attribution via pre/post stat-tuple snapshots.
 //!
 //! Detects file changes made by bash/shell tool calls by comparing filesystem
@@ -51,6 +52,7 @@ const HOOK_TIMEOUT_MS: u64 = 4000;
 std::thread_local! {
     static TEST_WALK_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_HOOK_TIMEOUT_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_MTIME_GRACE_SECS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_DAEMON_SOCKET: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -86,6 +88,14 @@ pub fn set_hook_timeout_ms_for_test(ms: u64) {
     TEST_HOOK_TIMEOUT_MS.with(|c| c.set(Some(ms)));
 }
 
+/// Override the mtime grace window (seconds) for the current thread, so tests
+/// can exercise the production 2 s window. Cleared by
+/// `reset_timeout_overrides_for_test()`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_mtime_grace_secs_for_test(secs: u64) {
+    TEST_MTIME_GRACE_SECS.with(|c| c.set(Some(secs)));
+}
+
 /// Override the daemon control socket path for the current thread.
 /// This avoids process-global env vars that race in parallel tests.
 #[cfg(any(test, feature = "test-support"))]
@@ -100,6 +110,7 @@ pub fn set_daemon_socket_for_test(path: std::path::PathBuf) {
 pub fn reset_timeout_overrides_for_test() {
     TEST_WALK_TIMEOUT_MS.with(|c| c.set(None));
     TEST_HOOK_TIMEOUT_MS.with(|c| c.set(None));
+    TEST_MTIME_GRACE_SECS.with(|c| c.set(None));
 }
 
 /// Resolve the daemon control socket path, preferring the thread-local test
@@ -117,8 +128,15 @@ fn effective_daemon_socket() -> Option<std::path::PathBuf> {
         .map(|c| c.control_socket_path)
 }
 
-/// Grace window in nanoseconds for low-resolution filesystem mtime comparison.
-const MTIME_GRACE_WINDOW_NS: u128 = (MTIME_GRACE_WINDOW_SECS as u128) * 1_000_000_000;
+/// Grace window in nanoseconds for low-resolution filesystem mtime comparison,
+/// honouring any test-time thread-local override.
+fn mtime_grace_window_ns() -> u128 {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(v) = TEST_MTIME_GRACE_SECS.with(|c| c.get()) {
+        return (v as u128) * 1_000_000_000;
+    }
+    (MTIME_GRACE_WINDOW_SECS as u128) * 1_000_000_000
+}
 
 /// Maximum number of files to track in a snapshot.  Repos larger than this
 /// skip the stat-diff system entirely (returning SnapshotFailed) to avoid adding
@@ -238,6 +256,13 @@ pub struct StatSnapshot {
     /// Used for Tier-1 stale detection in `find_stale_files`.
     #[serde(default)]
     pub per_file_wm: HashMap<String, u128>,
+    /// Files whose mtime sits inside the grace band above their watermark
+    /// (`wm < mtime <= wm + GRACE`). They are not in `entries` (so they are not
+    /// dirty paths), but their stat tuple is kept so the Post hook can tell an
+    /// edit made within the grace window of the previous checkpoint from an
+    /// untouched file.
+    #[serde(default)]
+    pub grace_entries: HashMap<PathBuf, StatEntry>,
 }
 
 /// Result of diffing two snapshots.
@@ -461,24 +486,40 @@ pub fn git_index_mtime_ns(repo_root: &Path) -> Option<u128> {
     Some(system_time_to_nanos(mtime))
 }
 
-/// Test whether a file is covered by the current watermarks, meaning it has
-/// not been modified since the last known-good baseline and does not need to
-/// be stored in the snapshot.
-///
-/// A file is covered when:
-/// - It has a per-file watermark AND `mtime ≤ file_wm + GRACE`, OR
-/// - No per-file watermark but an effective worktree wm exists AND
-///   `mtime ≤ effective_wm + GRACE`.
-fn is_wm_covered(
+/// How a file's mtime relates to the current watermarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WmCoverage {
+    /// `mtime > wm + GRACE`: modified since the baseline; stored in `entries`.
+    Dirty,
+    /// `wm < mtime <= wm + GRACE`: indistinguishable from the previous
+    /// checkpoint's own write by mtime alone; stored in `grace_entries`.
+    GraceBand,
+    /// `mtime <= wm`: unchanged since the baseline; not stored.
+    Covered,
+}
+
+/// Classify a file against its per-file watermark, or the effective worktree
+/// watermark when it has none. With no watermark at all the file is `Dirty`.
+fn classify_wm(
     mtime_ns: u128,
     effective_wm: Option<u128>,
     per_file_wm: &HashMap<String, u128>,
     posix_key: &str,
-) -> bool {
-    if let Some(&file_wm) = per_file_wm.get(posix_key) {
-        return mtime_ns <= file_wm + MTIME_GRACE_WINDOW_NS;
+) -> WmCoverage {
+    let wm = match per_file_wm.get(posix_key) {
+        Some(&file_wm) => file_wm,
+        None => match effective_wm {
+            Some(ewm) => ewm,
+            None => return WmCoverage::Dirty,
+        },
+    };
+    if mtime_ns <= wm {
+        WmCoverage::Covered
+    } else if mtime_ns <= wm + mtime_grace_window_ns() {
+        WmCoverage::GraceBand
+    } else {
+        WmCoverage::Dirty
     }
-    effective_wm.is_some_and(|ewm| mtime_ns <= ewm + MTIME_GRACE_WINDOW_NS)
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +614,7 @@ pub fn snapshot(
     let gitignore_filter = Arc::new(build_gitignore(repo_root)?);
 
     let mut entries = HashMap::new();
+    let mut grace_entries = HashMap::new();
 
     // Pass the git-ai ignore ruleset directly into the walker via filter_entry.
     // This prunes entire ignored directories (node_modules/, target/, etc.)
@@ -663,7 +705,10 @@ pub fn snapshot(
                 let stat = StatEntry::from_metadata(&meta);
                 let mtime_ns = stat.mtime.map(system_time_to_nanos).unwrap_or(0);
                 let posix_key = normalize_to_posix(&normalized.to_string_lossy());
-                if !is_wm_covered(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key) {
+                let coverage = classify_wm(mtime_ns, effective_worktree_wm, &per_file_wm, &posix_key);
+                if coverage == WmCoverage::GraceBand {
+                    grace_entries.insert(normalized, stat);
+                } else if coverage == WmCoverage::Dirty {
                     entries.insert(normalized, stat);
                     if entries.len() > MAX_TRACKED_FILES {
                         tracing::debug!(
@@ -696,6 +741,7 @@ pub fn snapshot(
         repo_root: repo_root.to_path_buf(),
         effective_worktree_wm,
         per_file_wm,
+        grace_entries,
     })
 }
 
@@ -731,6 +777,21 @@ pub fn diff(pre: &StatSnapshot, post: &StatSnapshot) -> StatDiffResult {
             && pre_entry != post_entry
         {
             result.modified.push(path.clone());
+        }
+    }
+
+    // Files in the post grace band: not dirty by mtime, but an edit within the
+    // grace window of the previous checkpoint lands here. Credit them only if
+    // the stat tuple differs from the Pre snapshot (or the file was covered, so
+    // absent from Pre, and its mtime has since moved above the watermark).
+    // Identical tuples are untouched by this tool call -- including a human
+    // write made before Pre -- and are never credited.
+    for (path, post_entry) in &post.grace_entries {
+        let pre_entry = pre.entries.get(path).or_else(|| pre.grace_entries.get(path));
+        match pre_entry {
+            Some(pre_entry) if pre_entry == post_entry => {}
+            Some(_) => result.modified.push(path.clone()),
+            None => result.created.push(path.clone()),
         }
     }
 
@@ -1059,6 +1120,19 @@ pub fn handle_bash_pre_tool_use_with_context(
     )
 }
 
+/// Dirty paths for the Pre hook: every file modified past the grace band plus
+/// every grace-band file. The daemon takes its watermark and stat from the same
+/// checkpoint, so a band file cannot be told apart from a human write made
+/// inside the band; checkpointing it as human first keeps those lines from
+/// being credited to the agent when the same call edits the file.
+fn pre_dirty_paths(repo_root: &Path, snap: &StatSnapshot) -> Vec<PathBuf> {
+    snap.entries
+        .keys()
+        .chain(snap.grace_entries.keys())
+        .map(|rel| repo_root.join(rel))
+        .collect()
+}
+
 /// Handle the pre-tool-use hook with a separately tracked original cwd.
 pub fn handle_bash_pre_tool_use_with_context_and_cwd(
     repo_root: &Path,
@@ -1092,7 +1166,7 @@ pub fn handle_bash_pre_tool_use_with_context_and_cwd(
             Err(_) => vec![],
         }
     } else {
-        snap.entries.keys().map(|rel| repo_root.join(rel)).collect()
+        pre_dirty_paths(repo_root, &snap)
     };
 
     let socket = effective_daemon_socket().ok_or_else(|| {
@@ -1361,6 +1435,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            grace_entries: HashMap::new(),
         };
         let post = StatSnapshot {
             entries: HashMap::new(),
@@ -1369,6 +1444,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            grace_entries: HashMap::new(),
         };
 
         let result = diff(&pre, &post);
@@ -1384,6 +1460,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            grace_entries: HashMap::new(),
         };
 
         let mut post_entries = HashMap::new();
@@ -1406,6 +1483,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            grace_entries: HashMap::new(),
         };
 
         let result = diff(&pre, &post);
@@ -1452,6 +1530,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            grace_entries: HashMap::new(),
         };
 
         let post = StatSnapshot {
@@ -1461,6 +1540,7 @@ mod tests {
             repo_root: PathBuf::from("/tmp"),
             effective_worktree_wm: None,
             per_file_wm: HashMap::new(),
+            grace_entries: HashMap::new(),
         };
 
         let result = diff(&pre, &post);
@@ -1719,5 +1799,174 @@ mod tests {
             should_include_new_file(&gitignore, Path::new("generated/manual.go"), false),
             "non-generated file in generated/ should not be ignored"
         );
+    }
+
+    // -- edits within the grace window of the previous checkpoint --
+
+    fn mtime_ns_of(path: &Path) -> u128 {
+        system_time_to_nanos(fs::metadata(path).unwrap().modified().unwrap())
+    }
+
+    fn wm_for(file: &str, wm_ns: u128) -> DaemonWatermarks {
+        DaemonWatermarks {
+            per_file: HashMap::from([(file.to_string(), wm_ns)]),
+            worktree: Some(wm_ns),
+        }
+    }
+
+    /// Two Bash edits of one file a few ms apart: the daemon watermark is the
+    /// first edit's mtime, so the second edit lands inside the 2 s grace band.
+    /// It must still be reported as changed.
+    #[test]
+    fn test_diff_credits_edit_within_grace_of_previous_checkpoint() {
+        set_mtime_grace_secs_for_test(2);
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "one\n").unwrap();
+        let wm = wm_for("a.txt", mtime_ns_of(&file));
+
+        let pre = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert!(pre.entries.is_empty(), "covered file is not a dirty path");
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let post = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+
+        let result = diff(&pre, &post);
+        assert_eq!(result.all_changed_paths(), vec!["a.txt".to_string()]);
+        reset_timeout_overrides_for_test();
+    }
+
+    /// Chain of four edits ~20 ms apart (the repro): every one is reported,
+    /// with the watermark advancing to each edit's mtime after its checkpoint.
+    #[test]
+    fn test_diff_credits_every_edit_in_rapid_sequence() {
+        set_mtime_grace_secs_for_test(2);
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "0\n").unwrap();
+        let mut wm = wm_for("a.txt", mtime_ns_of(&file));
+
+        for i in 1..=4 {
+            let pre = snapshot(dir.path(), "s", &format!("t{i}"), Some(&wm)).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            fs::write(&file, format!("{i}\n").repeat(i + 1)).unwrap();
+            let post = snapshot(dir.path(), "s", &format!("t{i}"), Some(&wm)).unwrap();
+            assert_eq!(
+                diff(&pre, &post).all_changed_paths(),
+                vec!["a.txt".to_string()],
+                "edit {i} must be recorded"
+            );
+            wm = wm_for("a.txt", mtime_ns_of(&file));
+        }
+        reset_timeout_overrides_for_test();
+    }
+
+    /// Human writes are never credited to the agent: a file written by a human
+    /// (even inside the grace band) before the Pre snapshot has an identical
+    /// stat tuple in Post, so the bash call that did not touch it reports
+    /// nothing.
+    #[test]
+    fn test_diff_never_credits_human_write_before_pre_snapshot() {
+        set_mtime_grace_secs_for_test(2);
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "agent\n").unwrap();
+        let wm = wm_for("a.txt", mtime_ns_of(&file));
+
+        // Human edit lands in the grace band after the checkpoint.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "agent\nhuman\n").unwrap();
+
+        // Bash call that does not touch a.txt.
+        let pre = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert!(
+            pre.grace_entries
+                .contains_key(&normalize_path(Path::new("a.txt"))),
+            "a.txt must sit in the grace band or this test passes vacuously"
+        );
+        fs::write(dir.path().join("b.txt"), "x\n").unwrap();
+        let post = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+
+        let paths = diff(&pre, &post).all_changed_paths();
+        assert!(
+            !paths.iter().any(|p| p == "a.txt"),
+            "human-written a.txt must not be credited: {paths:?}"
+        );
+        assert!(paths.iter().any(|p| p == "b.txt"));
+        reset_timeout_overrides_for_test();
+    }
+
+    /// A human writes inside the grace band after the checkpoint, then the same
+    /// Bash call edits the file: the file is a Pre dirty path (checkpointed as
+    /// human first), so the human lines are not credited to the agent.
+    #[test]
+    fn test_pre_dirty_paths_include_human_write_in_grace_band_then_same_call_edit() {
+        set_mtime_grace_secs_for_test(2);
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "agent\n").unwrap();
+        let wm = wm_for("a.txt", mtime_ns_of(&file));
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "agent\nhuman\n").unwrap();
+
+        let pre = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert!(pre.grace_entries.contains_key(&normalize_path(Path::new("a.txt"))));
+        let dirty = pre_dirty_paths(dir.path(), &pre);
+        assert!(
+            dirty.contains(&dir.path().join("a.txt")),
+            "human write in the band must be a dirty path: {dirty:?}"
+        );
+
+        // The same Bash call then edits the file; Post reports it as changed.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "agent\nhuman\nbash\n").unwrap();
+        let post = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert_eq!(diff(&pre, &post).all_changed_paths(), vec!["a.txt".to_string()]);
+        reset_timeout_overrides_for_test();
+    }
+
+    /// An untouched file inside the grace band is never reported (identical
+    /// tuples).
+    #[test]
+    fn test_diff_ignores_unchanged_grace_band_file() {
+        set_mtime_grace_secs_for_test(2);
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "1\n").unwrap();
+        let wm = wm_for("a.txt", mtime_ns_of(&file) - 1);
+
+        let pre = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        let post = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert!(pre.entries.is_empty());
+        assert!(pre.grace_entries.contains_key(&normalize_path(Path::new("a.txt"))));
+        assert!(diff(&pre, &post).is_empty());
+        reset_timeout_overrides_for_test();
+    }
+
+    /// A covered file (mtime <= watermark) edited so its mtime moves into the
+    /// band is absent from Pre and present in Post: reported.
+    #[test]
+    fn test_diff_credits_covered_file_edited_into_grace_band() {
+        set_mtime_grace_secs_for_test(2);
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "1\n").unwrap();
+        let wm = wm_for("a.txt", mtime_ns_of(&file) + 1_000_000);
+
+        let pre = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert!(pre.entries.is_empty() && pre.grace_entries.is_empty());
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "12\n").unwrap();
+        let post = snapshot(dir.path(), "s", "t1", Some(&wm)).unwrap();
+        assert_eq!(diff(&pre, &post).all_changed_paths(), vec!["a.txt".to_string()]);
+        reset_timeout_overrides_for_test();
     }
 }

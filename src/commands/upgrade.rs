@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::api::client::ApiContext;
 use crate::config::{self, UpdateChannel};
 use crate::observability::log_message;
@@ -47,6 +48,18 @@ unsafe extern "system" {
     fn Process32FirstW(snapshot: WindowsHandle, entry: *mut ProcessEntry32W) -> i32;
     fn Process32NextW(snapshot: WindowsHandle, entry: *mut ProcessEntry32W) -> i32;
     fn CloseHandle(handle: WindowsHandle) -> i32;
+}
+
+// Fork-only: CodeSense owns updates to -cs builds; omit this guard upstream.
+const FORK_UPGRADE_NOTICE: &str =
+    "this is the alfypops build of git-ai; it is updated by CodeSense";
+
+fn ensure_upstream_updates_allowed() -> Result<(), String> {
+    if env!("CARGO_PKG_VERSION").contains("-cs.") {
+        Err(FORK_UPGRADE_NOTICE.to_string())
+    } else {
+        Ok(())
+    }
 }
 
 const UPDATE_CHECK_INTERVAL_HOURS: u64 = 24;
@@ -645,6 +658,10 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
 }
 
 pub fn run_with_args(args: &[String]) {
+    if let Err(reason) = ensure_upstream_updates_allowed() {
+        eprintln!("{}", reason);
+        std::process::exit(1);
+    }
     #[cfg(windows)]
     exit_if_invoked_via_git_extension();
 
@@ -842,6 +859,10 @@ fn print_cached_notice(cache: &UpdateCache) {
 }
 
 pub fn maybe_schedule_background_update_check() {
+    if let Err(reason) = ensure_upstream_updates_allowed() {
+        tracing::debug!("{}", reason);
+        return;
+    }
     let config = config::Config::get();
     if config.version_checks_disabled() {
         return;
@@ -902,6 +923,7 @@ pub enum DaemonUpdateCheckResult {
 /// Returns `Ok(UpdateReady)` if the install script ran, `Ok(NoUpdate)` if
 /// no pending update was found or updates are disabled.
 pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult, String> {
+    ensure_upstream_updates_allowed()?;
     let config = config::Config::fresh();
     if config.version_checks_disabled() || config.auto_updates_disabled() {
         return Ok(DaemonUpdateCheckResult::NoUpdate);
@@ -975,6 +997,7 @@ pub fn check_and_install_update_if_available() -> Result<DaemonUpdateCheckResult
 /// and updates the local cache. Returns `DaemonUpdateCheckResult::UpdateReady` when
 /// the channel has a newer version than the running binary.
 pub fn check_for_update_available() -> Result<DaemonUpdateCheckResult, String> {
+    ensure_upstream_updates_allowed()?;
     let config = config::Config::fresh();
     if config.version_checks_disabled() {
         return Ok(DaemonUpdateCheckResult::NoUpdate);
@@ -1045,6 +1068,12 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    // On cs builds run_impl is unreachable behind the entry guard; semver ranks 1.7.5-cs.1 below 1.7.5.
+    fn upstream_test_version() -> &'static str {
+        let current = env!("CARGO_PKG_VERSION");
+        current.split_once("-cs.").map_or(current, |(base, _)| base)
+    }
 
     fn set_test_cache_dir(dir: &tempfile::TempDir) {
         unsafe {
@@ -1125,7 +1154,7 @@ mod tests {
         set_test_cache_dir(&temp_dir);
 
         let mock_url = |body: &str| format!("mock://{}", body);
-        let current = env!("CARGO_PKG_VERSION");
+        let current = upstream_test_version();
         let test_checksum = "a".repeat(64); // Valid SHA256 length
 
         // Newer version available - should upgrade
@@ -1145,12 +1174,10 @@ mod tests {
             "{{\"channels\":{{\"latest\":{{\"version\":\"v{}\",\"checksum\":\"{}\"}},\"next\":{{\"version\":\"v{}-next-deadbeef\",\"checksum\":\"{}\"}}}}}}",
             current, test_checksum, current, test_checksum
         );
-        let action = run_impl_with_url(
-            false,
-            &mock_url(&same_version_payload),
-            UpdateChannel::Latest,
-            true,
-        );
+        let release =
+            fetch_release_for_channel(&mock_url(&same_version_payload), UpdateChannel::Latest)
+                .unwrap();
+        let action = determine_action(false, &release, current);
         assert_eq!(action, UpgradeAction::AlreadyLatest);
 
         // Same version with --force - force reinstall
@@ -1196,7 +1223,7 @@ mod tests {
         set_test_cache_dir(&temp_dir);
 
         let mock_url = |body: &str| format!("mock://{}", body);
-        let current = env!("CARGO_PKG_VERSION");
+        let current = upstream_test_version();
         let test_checksum = "a".repeat(64); // Valid SHA256 length
 
         // Newer version available - should upgrade
@@ -1216,12 +1243,12 @@ mod tests {
             "{{\"channels\":{{\"enterprise-latest\":{{\"version\":\"v{}\",\"checksum\":\"{}\"}},\"enterprise-next\":{{\"version\":\"v{}-next-deadbeef\",\"checksum\":\"{}\"}}}}}}",
             current, test_checksum, current, test_checksum
         );
-        let action = run_impl_with_url(
-            false,
+        let release = fetch_release_for_channel(
             &mock_url(&same_version_payload),
             UpdateChannel::EnterpriseLatest,
-            true,
-        );
+        )
+        .unwrap();
+        let action = determine_action(false, &release, current);
         assert_eq!(action, UpgradeAction::AlreadyLatest);
 
         // Same version with --force - force reinstall
@@ -1756,7 +1783,7 @@ mod tests {
 
     #[test]
     fn test_check_for_update_available_same_version() {
-        let current = env!("CARGO_PKG_VERSION");
+        let current = upstream_test_version();
         let test_checksum = "a".repeat(64);
         let mock_payload = format!(
             r#"{{"channels":{{"latest":{{"version":"v{}","checksum":"{}"}}}}}}"#,
@@ -1785,6 +1812,19 @@ mod tests {
             UpdateChannel::Latest,
             Some(&cache)
         ));
+    }
+
+    fn assert_update_check_result(expected: DaemonUpdateCheckResult) {
+        let result = check_for_update_available();
+        if env!("CARGO_PKG_VERSION").contains("-cs.") {
+            assert_eq!(result.unwrap_err(), FORK_UPGRADE_NOTICE);
+            assert_eq!(
+                check_and_install_update_if_available().unwrap_err(),
+                FORK_UPGRADE_NOTICE
+            );
+        } else {
+            assert_eq!(result.unwrap(), expected);
+        }
     }
 
     fn with_update_check_env(
@@ -1824,8 +1864,7 @@ mod tests {
     #[serial]
     fn check_for_update_available_returns_update_ready_when_cache_has_pending_update() {
         with_update_check_env(true, false, || {
-            let result = check_for_update_available().unwrap();
-            assert_eq!(result, DaemonUpdateCheckResult::UpdateReady);
+            assert_update_check_result(DaemonUpdateCheckResult::UpdateReady);
         });
     }
 
@@ -1833,8 +1872,7 @@ mod tests {
     #[serial]
     fn check_for_update_available_returns_no_update_when_auto_updates_disabled() {
         with_update_check_env(true, true, || {
-            let result = check_for_update_available().unwrap();
-            assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
+            assert_update_check_result(DaemonUpdateCheckResult::NoUpdate);
         });
     }
 
@@ -1842,8 +1880,7 @@ mod tests {
     #[serial]
     fn check_for_update_available_returns_no_update_when_cache_has_no_pending_update() {
         with_update_check_env(false, false, || {
-            let result = check_for_update_available().unwrap();
-            assert_eq!(result, DaemonUpdateCheckResult::NoUpdate);
+            assert_update_check_result(DaemonUpdateCheckResult::NoUpdate);
         });
     }
 }

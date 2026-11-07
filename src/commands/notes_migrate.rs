@@ -1,6 +1,7 @@
+//! Modified by alfypops, 2026: central authorship notes namespace.
 //! `git-ai notes migrate` — bulk-upload existing git notes to the HTTP backend.
 //!
-//! This command reads all notes stored in `refs/notes/ai` via `git notes --ref=ai list`,
+//! This command reads all notes stored in the configured authorship ref via `git notes --ref=<notes-ref> list`,
 //! fetches their content using `git cat-file --batch`, uploads them to the remote HTTP
 //! backend in chunks of 50, and persists them locally in `notes-db` with `synced = 1`
 //! so the cache is warm immediately after migration.
@@ -85,9 +86,9 @@ pub fn handle_notes_migrate(args: &[String]) {
         std::process::exit(1);
     }
 
-    eprintln!("Listing notes from refs/notes/ai ...");
+    eprintln!("Listing authorship notes ...");
 
-    // 4. List notes: `git notes --ref=ai list` → "blob_sha commit_sha\n" lines.
+    // 4. List notes: `git notes --ref=<notes-ref> list` → "blob_sha commit_sha\n" lines.
     let note_pairs = match list_notes(&repo) {
         Ok(pairs) => pairs,
         Err(e) => {
@@ -97,7 +98,7 @@ pub fn handle_notes_migrate(args: &[String]) {
     };
 
     if note_pairs.is_empty() {
-        eprintln!("No notes found in refs/notes/ai. Nothing to migrate.");
+        eprintln!("No notes found in the configured authorship ref. Nothing to migrate.");
         return;
     }
 
@@ -234,7 +235,7 @@ pub fn handle_notes_migrate(args: &[String]) {
     }
 }
 
-/// Run `git notes --ref=ai list` and return `(blob_sha, commit_sha)` pairs.
+/// Run `git notes --ref=<notes-ref> list` and return `(blob_sha, commit_sha)` pairs.
 fn list_notes(
     repo: &crate::git::repository::Repository,
 ) -> Result<Vec<(String, String)>, GitAiError> {
@@ -243,12 +244,12 @@ fn list_notes(
     let mut args = repo.global_args_for_exec();
     args.extend([
         "notes".to_string(),
-        "--ref=ai".to_string(),
+        format!("--ref={}", crate::git::refs::authorship_notes_ref()?.name),
         "list".to_string(),
     ]);
 
     let output = exec_git(&args)
-        .map_err(|e| GitAiError::Generic(format!("git notes --ref=ai list failed: {}", e)))?;
+        .map_err(|e| GitAiError::Generic(format!("git notes list failed: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -257,7 +258,7 @@ fn list_notes(
             return Ok(Vec::new());
         }
         return Err(GitAiError::Generic(format!(
-            "git notes --ref=ai list exited {}: {}",
+            "git notes list exited {}: {}",
             output.status, stderr
         )));
     }
@@ -407,7 +408,9 @@ fn print_help() {
     eprintln!("  -h, --help      Show this help message");
     eprintln!();
     eprintln!("Description:");
-    eprintln!("  Reads all notes from refs/notes/ai, uploads them to the configured HTTP");
+    eprintln!(
+        "  Reads all notes from the configured authorship ref, uploads them to the configured HTTP"
+    );
     eprintln!("  notes backend (in chunks of 50), and caches them locally in notes-db");
     eprintln!("  with synced = 1 so the local cache is warm immediately.");
     eprintln!();
@@ -435,10 +438,21 @@ mod tests {
         repo.commit_all(message).expect("commit")
     }
 
-    /// Add a git note to `refs/notes/ai` for the given commit SHA.
+    /// Add a git note to the configured authorship ref for the given commit SHA.
     fn add_git_note(repo: &TmpRepo, commit_sha: &str, note: &str) {
-        repo.git_command(&["notes", "--ref=ai", "add", "-f", "-m", note, commit_sha])
-            .expect("git notes add");
+        repo.git_command(&[
+            "notes",
+            &format!(
+                "--ref={}",
+                crate::git::refs::authorship_notes_ref().unwrap().name
+            ),
+            "add",
+            "-f",
+            "-m",
+            note,
+            commit_sha,
+        ])
+        .expect("git notes add");
     }
 
     /// Integration test:

@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: pin authorship namespace throughout revert carry-over.
 use std::collections::{HashMap, HashSet};
 
 use crate::authorship::authorship_log::LineRange;
@@ -32,6 +33,7 @@ pub(crate) fn handle_revert_commits_with_metrics(
     repo: &Repository,
     specs: &[RevertSpec],
 ) -> Result<Vec<RewriteMetricCommit>, GitAiError> {
+    let notes_ref = crate::git::refs::authorship_notes_ref()?;
     if specs.is_empty() {
         return Ok(Vec::new());
     }
@@ -138,7 +140,7 @@ pub(crate) fn handle_revert_commits_with_metrics(
         v.dedup();
         v
     };
-    let notes = notes_api::read_notes_batch(repo, &source_base_shas)?;
+    let notes = notes_api::read_notes_batch_from_ref(repo, &source_base_shas, &notes_ref)?;
 
     // Build one batched diff-tree request covering, for each reverted commit:
     //  - (source_base, revert_commit): hunks to shift the source note forward,
@@ -232,7 +234,7 @@ pub(crate) fn handle_revert_commits_with_metrics(
     }
 
     if !writes.is_empty() {
-        notes_api::write_notes_batch(repo, &writes)?;
+        notes_api::write_notes_batch_to_ref(repo, &writes, &notes_ref)?;
     }
     Ok(metric_commits)
 }

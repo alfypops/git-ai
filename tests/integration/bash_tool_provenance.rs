@@ -1,3 +1,4 @@
+//! Modified by alfypops, 2026: rapid Bash edits inside the grace window and human writes in the grace band.
 //! Integration tests for AI provenance tracking via bash tool pre/post snapshots.
 //!
 //! Each test simulates what happens when an AI coding agent executes a bash
@@ -7,11 +8,13 @@
 //! modified, and deleted files across a wide variety of real-world shell
 //! commands.
 
+use crate::repos::test_file::ExpectedLineExt;
 use crate::repos::test_repo::TestRepo;
-use git_ai::authorship::working_log::AgentId;
+use git_ai::authorship::working_log::{AgentId, CheckpointKind};
 use git_ai::commands::checkpoint_agent::bash_tool::{
     BashCheckpointAction, BashPostHookResult, diff, git_status_fallback, handle_bash_post_tool_use,
-    handle_bash_pre_tool_use_with_context, set_daemon_socket_for_test, snapshot,
+    handle_bash_pre_tool_use_with_context, reset_timeout_overrides_for_test,
+    set_daemon_socket_for_test, set_mtime_grace_secs_for_test, snapshot,
 };
 use std::fs;
 use std::process::Command;
@@ -1631,4 +1634,115 @@ exit 1
     // The stat-diff should detect the modification
     let post_action = post_hook(&root, "hookfail-sess", "hookfail-t1");
     assert_checkpoint_contains(&post_action, "broken.py");
+}
+
+// ===========================================================================
+// Rapid edits inside the 2 s mtime grace window
+// ===========================================================================
+
+/// Drive one Bash call the way the orchestrator does: Pre, a human checkpoint of
+/// the Pre dirty paths, the command, Post, an AI checkpoint of the changed paths.
+fn bash_call_with_checkpoints(repo: &TestRepo, root: &std::path::Path, tool_use_id: &str, script: &str) {
+    let pre = handle_bash_pre_tool_use_with_context(
+        root,
+        "rapid-sess",
+        tool_use_id,
+        &dummy_agent_id(),
+        None,
+        dummy_trace_id(),
+        None,
+    )
+    .expect("pre-hook should succeed");
+    let dirty: Vec<String> = pre
+        .dirty_paths
+        .iter()
+        .filter_map(|p| p.strip_prefix(root).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    if !dirty.is_empty() {
+        let mut args = vec!["checkpoint", "mock_known_human"];
+        args.extend(dirty.iter().map(String::as_str));
+        repo.git_ai(&args).expect("human checkpoint should succeed");
+    }
+
+    run_bash(repo, "sh", &["-c", script]);
+
+    let post = post_hook(root, "rapid-sess", tool_use_id);
+    let paths = checkpoint_paths(&post).to_vec();
+    assert!(
+        paths.iter().any(|p| p.contains("a.txt")),
+        "edit must be detected; got {paths:?}"
+    );
+    let mut args = vec!["checkpoint", "mock_ai"];
+    args.extend(paths.iter().map(String::as_str));
+    repo.git_ai(&args).expect("AI checkpoint should succeed");
+}
+
+fn ai_checkpoint_count(repo: &TestRepo) -> usize {
+    repo.current_working_logs()
+        .read_all_checkpoints()
+        .expect("checkpoints should be readable")
+        .iter()
+        .filter(|cp| cp.kind == CheckpointKind::AiAgent)
+        .count()
+}
+
+/// Three Bash edits of one file with gaps of 0, 1.5 and 3 s (grace 2 s): each
+/// edit gets its own AiAgent record and no human line is credited to the agent.
+#[test]
+fn test_bash_rapid_edits_each_get_an_ai_record_and_no_human_credit() {
+    for gap_ms in [0u64, 1500, 3000] {
+        set_mtime_grace_secs_for_test(2);
+        let repo = TestRepo::new();
+        let root = repo_root(&repo);
+        add_and_commit(&repo, "a.txt", "base\n", "initial commit");
+
+        for i in 0..3 {
+            bash_call_with_checkpoints(
+                &repo,
+                &root,
+                &format!("t{i}"),
+                &format!("echo ai{i} >> a.txt"),
+            );
+            thread::sleep(Duration::from_millis(gap_ms));
+        }
+
+        assert_eq!(
+            ai_checkpoint_count(&repo),
+            3,
+            "one AiAgent record per edit at gap {gap_ms} ms"
+        );
+        repo.stage_all_and_commit("rapid edits").unwrap();
+        repo.filename("a.txt").assert_committed_lines(crate::lines![
+            "base".human(),
+            "ai0".ai(),
+            "ai1".ai(),
+            "ai2".ai(),
+        ]);
+        reset_timeout_overrides_for_test();
+    }
+}
+
+/// A human write inside the grace band after an agent edit, then another Bash
+/// edit: the human line stays human.
+#[test]
+fn test_bash_human_write_in_grace_band_not_credited_to_next_edit() {
+    set_mtime_grace_secs_for_test(2);
+    let repo = TestRepo::new();
+    let root = repo_root(&repo);
+    add_and_commit(&repo, "a.txt", "base\n", "initial commit");
+
+    bash_call_with_checkpoints(&repo, &root, "t0", "echo ai0 >> a.txt");
+    run_bash(&repo, "sh", &["-c", "echo human >> a.txt"]);
+    bash_call_with_checkpoints(&repo, &root, "t1", "echo ai1 >> a.txt");
+
+    assert_eq!(ai_checkpoint_count(&repo), 2);
+    repo.stage_all_and_commit("mixed edits").unwrap();
+    repo.filename("a.txt").assert_committed_lines(crate::lines![
+        "base".human(),
+        "ai0".ai(),
+        "human".human(),
+        "ai1".ai(),
+    ]);
+    reset_timeout_overrides_for_test();
 }

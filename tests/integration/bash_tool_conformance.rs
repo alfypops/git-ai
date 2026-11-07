@@ -1,3 +1,4 @@
+//! Modified by alfypops, 2026: snapshot fixtures carry grace-band entries.
 //! Conformance test suite for the bash tool change attribution feature.
 //!
 //! Covers PRD Sections 5.1 (file mutations), 5.2 (read-only operations),
@@ -1109,6 +1110,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
         repo_root: PathBuf::from("/tmp"),
         effective_worktree_wm: None,
         per_file_wm: HashMap::new(),
+        grace_entries: HashMap::new(),
     };
 
     let mut post_entries = HashMap::new();
@@ -1144,6 +1146,7 @@ fn test_diff_no_gitignore_includes_all_new_files() {
         repo_root: PathBuf::from("/tmp"),
         effective_worktree_wm: None,
         per_file_wm: HashMap::new(),
+        grace_entries: HashMap::new(),
     };
 
     let result = diff(&pre, &post);

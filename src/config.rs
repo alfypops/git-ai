@@ -1,10 +1,13 @@
+// Modified by alfypops, 2026: configurable authorship notes namespace.
+// Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: daemon_repo_roots allow-list for trace2 ingestion.
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use glob::Pattern;
 use serde::{Deserialize, Serialize, Serializer};
@@ -28,7 +31,7 @@ pub(crate) const MAX_DAEMON_MEMORY_LIMIT_MB: u64 = u64::MAX / MEBIBYTE_BYTES;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NotesBackendKind {
-    /// Default: store notes in git refs/notes/ai (existing behavior)
+    /// Default: store notes in the configured Git authorship ref
     #[default]
     GitNotes,
     /// HTTP backend: queue writes to notes-db, flush via daemon, reads from cache
@@ -190,11 +193,41 @@ pub struct Config {
     git_ai_hooks: HashMap<String, Vec<String>>,
     codex_hooks_format: CodexHooksFormat,
     notes_backend: NotesBackendConfig,
+    notes_ref: Result<String, String>,
+    notes_push: NotesPush,
+    #[serde(serialize_with = "serialize_patterns")]
+    notes_push_repositories: Vec<Pattern>,
     transcript_streaming_lookback_days: Option<u32>,
     max_checkpoint_file_size_bytes: usize,
     max_checkpoint_total_size_bytes: usize,
     max_checkpoint_total_lines: usize,
     daemon_memory_limit_mb: Option<u64>,
+}
+
+/// Controls automatic publication of local authorship notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotesPush {
+    #[default]
+    Always,
+    Never,
+}
+
+impl NotesPush {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize)]
@@ -243,6 +276,9 @@ pub struct FileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub untraced_fixup_ignored_paths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_raw_value")]
+    pub daemon_repo_roots: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_oss: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_enterprise_dsn: Option<String>,
@@ -276,6 +312,13 @@ pub struct FileConfig {
     pub codex_hooks_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_backend: Option<NotesBackendConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_raw_value")]
+    pub notes_ref: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_push: Option<NotesPush>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_push_repositories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_streaming_lookback_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,6 +391,13 @@ pub struct ConfigPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_backend: Option<NotesBackendConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_raw_value")]
+    pub notes_ref: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_push: Option<NotesPush>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_push_repositories: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_streaming_lookback_days: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_checkpoint_file_size_bytes: Option<usize>,
@@ -359,7 +409,204 @@ pub struct ConfigPatch {
     pub daemon_memory_limit_mb: Option<u64>,
 }
 
+fn parse_notes_ref(value: &serde_json::Value) -> Result<String, String> {
+    let name = value
+        .as_str()
+        .ok_or_else(|| "Invalid notes_ref: expected a string".to_string())?;
+    validate_notes_ref(name)?;
+    Ok(name.to_string())
+}
+
+// Preserve explicit null and wrong types so invalid settings cannot become the default.
+fn deserialize_raw_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
+/// Validate a single safe component without invoking Git.
+pub fn validate_notes_ref(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.ends_with(".lock")
+        || value.contains("..")
+        || value.contains("@{")
+        || value
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "/\\~^:?*[".contains(c))
+    {
+        return Err("Invalid notes_ref: expected one safe Git ref component".to_string());
+    }
+    Ok(())
+}
+
+/// The repositories the daemon ingests trace2 events for (`daemon_repo_roots`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonRepoRoots {
+    /// Canonicalized roots; `None` when no list is set (every repo is handled).
+    roots: Option<Vec<PathBuf>>,
+}
+
+impl DaemonRepoRoots {
+    pub fn is_active(&self) -> bool {
+        self.roots.is_some()
+    }
+
+    /// Whether the list names at least one valid root. An active list with
+    /// none (an invalid value) fails closed without naming anything.
+    pub fn has_entries(&self) -> bool {
+        self.roots.as_ref().is_some_and(|roots| !roots.is_empty())
+    }
+
+    /// Whether a canonical common dir is under a listed root, compared by path
+    /// component (`/a/b` does not cover `/a/bc`).
+    pub fn allows(&self, canonical_common_dir: &Path) -> bool {
+        self.roots.as_ref().is_none_or(|roots| {
+            roots
+                .iter()
+                .any(|root| canonical_common_dir.starts_with(root))
+        })
+    }
+}
+
+pub fn validate_daemon_repo_root(value: &str) -> Result<(), String> {
+    if Path::new(value).is_absolute() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid daemon_repo_roots entry '{}': expected an absolute path",
+            value
+        ))
+    }
+}
+
+/// Parses `daemon_repo_roots`, returning the problems found for the caller to
+/// log. An empty array means no list. An invalid value keeps its valid entries
+/// and fails closed for every other repo.
+pub(crate) fn parse_daemon_repo_roots(
+    value: Option<&serde_json::Value>,
+) -> (DaemonRepoRoots, Vec<String>) {
+    let Some(value) = value else {
+        return (DaemonRepoRoots::default(), Vec::new());
+    };
+    let Some(entries) = value.as_array() else {
+        return (
+            DaemonRepoRoots {
+                roots: Some(Vec::new()),
+            },
+            vec!["Invalid daemon_repo_roots: expected an array of absolute paths".to_string()],
+        );
+    };
+    if entries.is_empty() {
+        return (DaemonRepoRoots::default(), Vec::new());
+    }
+    let mut roots = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let Some(raw) = entry.as_str() else {
+            errors.push(format!(
+                "Invalid daemon_repo_roots entry {}: expected an absolute path",
+                entry
+            ));
+            continue;
+        };
+        match validate_daemon_repo_root(raw) {
+            Ok(()) => {
+                let path = PathBuf::from(raw);
+                roots.push(path.canonicalize().unwrap_or(path));
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    (DaemonRepoRoots { roots: Some(roots) }, errors)
+}
+
+struct CachedDaemonRepoRoots {
+    /// The config file's (mtime, len); `None` when it doesn't exist.
+    stamp: Option<(SystemTime, u64)>,
+    roots: Arc<DaemonRepoRoots>,
+}
+
+static DAEMON_REPO_ROOTS_CACHE: Mutex<Option<CachedDaemonRepoRoots>> = Mutex::new(None);
+
+/// Re-reads `daemon_repo_roots` only when the config file's mtime (or size)
+/// changes, so a long-lived daemon picks up roots added at runtime without a
+/// TTL. A file that can't be read or parsed keeps the previous list until it
+/// changes again.
+fn load_daemon_repo_roots_cached(
+    path: &Path,
+    cache: &Mutex<Option<CachedDaemonRepoRoots>>,
+) -> Arc<DaemonRepoRoots> {
+    let stamp = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| Some((metadata.modified().ok()?, metadata.len())));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cached) = guard.as_ref()
+        && cached.stamp == stamp
+    {
+        return cached.roots.clone();
+    }
+    // Only this key is read, from a plain JSON parse: a wrong-typed value
+    // elsewhere in the file must not disable the list.
+    // `names_list` says whether an unparseable file mentions the key at all.
+    let (file, names_list) = match fs::read(path) {
+        Ok(data) => {
+            let names_list = data
+                .windows(b"\"daemon_repo_roots\"".len())
+                .any(|window| window == b"\"daemon_repo_roots\"");
+            (
+                serde_json::from_slice::<serde_json::Value>(without_utf8_bom(&data))
+                    .map(Some)
+                    .ok(),
+                names_list,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Some(None), false),
+        Err(_) => (None, false),
+    };
+    let roots = match (file, guard.as_ref()) {
+        (Some(file), _) => {
+            let (roots, errors) = parse_daemon_repo_roots(
+                file.as_ref().and_then(|file| file.get("daemon_repo_roots")),
+            );
+            for error in errors {
+                eprintln!("Warning: {}", error);
+            }
+            Arc::new(roots)
+        }
+        (None, Some(cached)) => cached.roots.clone(),
+        // Nothing known yet and the file can't be parsed but names the list:
+        // fail closed until it changes. Without the key, track every repo as
+        // upstream does.
+        (None, None) if names_list => {
+            eprintln!(
+                "Warning: config file with daemon_repo_roots is unparseable; the daemon ignores every repository until it changes"
+            );
+            Arc::new(DaemonRepoRoots {
+                roots: Some(Vec::new()),
+            })
+        }
+        (None, None) => Arc::default(),
+    };
+    *guard = Some(CachedDaemonRepoRoots {
+        stamp,
+        roots: roots.clone(),
+    });
+    roots
+}
+
 impl Config {
+    /// The daemon's `daemon_repo_roots`, reloaded when the config file changes.
+    pub fn daemon_repo_roots_cached() -> Arc<DaemonRepoRoots> {
+        config_file_path()
+            .map(|path| load_daemon_repo_roots_cached(&path, &DAEMON_REPO_ROOTS_CACHE))
+            .unwrap_or_default()
+    }
+
     /// Initialize the global configuration exactly once.
     /// Safe to call multiple times; subsequent calls are no-ops.
     #[allow(dead_code)]
@@ -378,6 +625,13 @@ impl Config {
     /// config updates (for example, prompt sharing/privacy toggles).
     pub fn fresh() -> Self {
         build_config()
+    }
+
+    /// A push must distinguish a missing config from an incomplete concurrent write.
+    pub(crate) fn fresh_for_notes_push() -> Result<Self, &'static str> {
+        load_file_config_checked()
+            .map(build_config_from_file)
+            .map_err(|_| "config unreadable")
     }
 
     /// Return the fresh author override with a short process-local TTL.
@@ -427,6 +681,44 @@ impl Config {
     /// `daemon::untraced_fixup_ignore`); not a global repository exclusion.
     pub fn untraced_fixup_ignored_paths(&self) -> &[Pattern] {
         &self.untraced_fixup_ignored_paths
+    }
+
+    /// Called only by the process-cached authorship namespace accessor.
+    pub(crate) fn load_notes_ref_checked() -> Result<String, String> {
+        let file = load_file_config_checked()
+            .map_err(|reason| format!("Invalid notes_ref configuration: {}", reason))?;
+        build_config_from_file(file).notes_ref
+    }
+
+    pub fn notes_push(&self) -> NotesPush {
+        self.notes_push
+    }
+
+    pub fn notes_push_repositories(&self) -> Vec<&str> {
+        self.notes_push_repositories
+            .iter()
+            .map(Pattern::as_str)
+            .collect()
+    }
+
+    pub(crate) fn notes_push_skip_reason(
+        &self,
+        repository_remotes: &[(String, String)],
+        remote_url: &str,
+    ) -> Option<&'static str> {
+        if remote_matches_patterns(&self.exclude_repositories, remote_url)
+            || repository_remotes
+                .iter()
+                .any(|(_, url)| remote_matches_patterns(&self.exclude_repositories, url))
+        {
+            Some("repository matches exclude_repositories")
+        } else if self.notes_push == NotesPush::Never
+            && !remote_matches_patterns(&self.notes_push_repositories, remote_url)
+        {
+            Some("notes_push is never and destination does not match notes_push_repositories")
+        } else {
+            None
+        }
     }
 
     pub fn has_repository_filters(&self) -> bool {
@@ -975,7 +1267,17 @@ fn author_config_file_fingerprint(path: &Path) -> Option<AuthorConfigFileFingerp
 }
 
 fn build_config() -> Config {
-    let file_cfg = load_file_config();
+    match load_file_config_checked() {
+        Ok(file) => build_config_from_file(file),
+        Err(reason) => {
+            let mut config = build_config_from_file(None);
+            config.notes_ref = Err(format!("Invalid notes_ref configuration: {}", reason));
+            config
+        }
+    }
+}
+
+fn build_config_from_file(file_cfg: Option<FileConfig>) -> Config {
     let exclude_prompts_in_repositories = file_cfg
         .as_ref()
         .and_then(|c| c.exclude_prompts_in_repositories.clone())
@@ -1024,22 +1326,29 @@ fn build_config() -> Config {
                 .ok()
         })
         .collect();
-    let exclude_repositories = file_cfg
-        .as_ref()
-        .and_then(|c| c.exclude_repositories.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|pattern_str| {
-            Pattern::new(&pattern_str)
-                .map_err(|e| {
-                    eprintln!(
-                        "Warning: Invalid glob pattern in exclude_repositories '{}': {}",
-                        pattern_str, e
-                    );
-                })
-                .ok()
-        })
-        .collect();
+    let exclude_repositories = parse_path_patterns(
+        "exclude_repositories",
+        file_cfg
+            .as_ref()
+            .and_then(|c| c.exclude_repositories.clone())
+            .unwrap_or_default(),
+    );
+    let notes_ref = match file_cfg.as_ref().and_then(|c| c.notes_ref.as_ref()) {
+        None => Ok(crate::git::refs::AI_AUTHORSHIP_REFNAME.to_string()),
+        Some(value) => parse_notes_ref(value),
+    };
+    let notes_push = env::var("GIT_AI_NOTES_PUSH")
+        .ok()
+        .and_then(|value| NotesPush::parse(&value))
+        .or_else(|| file_cfg.as_ref().and_then(|c| c.notes_push))
+        .unwrap_or_default();
+    let notes_push_repositories = parse_path_patterns(
+        "notes_push_repositories",
+        file_cfg
+            .as_ref()
+            .and_then(|c| c.notes_push_repositories.clone())
+            .unwrap_or_default(),
+    );
     let untraced_fixup_ignored_paths = parse_path_patterns(
         "untraced_fixup_ignored_paths",
         file_cfg
@@ -1288,6 +1597,9 @@ fn build_config() -> Config {
             git_ai_hooks: git_ai_hooks.clone(),
             codex_hooks_format,
             notes_backend,
+            notes_ref,
+            notes_push,
+            notes_push_repositories,
             transcript_streaming_lookback_days,
             max_checkpoint_file_size_bytes,
             max_checkpoint_total_size_bytes,
@@ -1323,6 +1635,9 @@ fn build_config() -> Config {
         git_ai_hooks,
         codex_hooks_format,
         notes_backend,
+        notes_ref,
+        notes_push,
+        notes_push_repositories,
         transcript_streaming_lookback_days,
         max_checkpoint_file_size_bytes,
         max_checkpoint_total_size_bytes,
@@ -1519,17 +1834,27 @@ fn resolve_git_path(file_cfg: &Option<FileConfig>) -> String {
     std::process::exit(1);
 }
 
-fn load_file_config() -> Option<FileConfig> {
-    let path = config_file_path()?;
-    let data = fs::read(&path).ok()?;
-    parse_file_config_bytes(&data).ok()
+fn load_file_config_checked() -> Result<Option<FileConfig>, String> {
+    let path =
+        config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Failed to read config file: {}", error)),
+    };
+    parse_file_config_bytes(&data)
+        .map(Some)
+        .map_err(|error| format!("Failed to parse config file: {}", error))
 }
 
 fn parse_file_config_bytes(data: &[u8]) -> Result<FileConfig, serde_json::Error> {
     // Windows PowerShell 5.1 writes UTF-8 with BOM by default for `Out-File -Encoding UTF8`.
     // Tolerate BOM-prefixed config files so upgrades/installers don't brick config parsing.
-    let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
-    serde_json::from_slice::<FileConfig>(data)
+    serde_json::from_slice::<FileConfig>(without_utf8_bom(data))
+}
+
+fn without_utf8_bom(data: &[u8]) -> &[u8] {
+    data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data)
 }
 
 fn config_file_path() -> Option<PathBuf> {
@@ -1611,17 +1936,7 @@ pub fn update_check_path() -> Option<PathBuf> {
 
 /// Load the raw file config
 pub fn load_file_config_public() -> Result<FileConfig, String> {
-    let path =
-        config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
-
-    if !path.exists() {
-        // Return empty config if file doesn't exist
-        return Ok(FileConfig::default());
-    }
-
-    let data = fs::read(&path).map_err(|e| format!("Failed to read config file: {}", e))?;
-
-    parse_file_config_bytes(&data).map_err(|e| format!("Failed to parse config file: {}", e))
+    Ok(load_file_config_checked()?.unwrap_or_default())
 }
 
 /// Save the file config
@@ -1629,16 +1944,11 @@ pub fn save_file_config(config: &FileConfig) -> Result<(), String> {
     let path =
         config_file_path().ok_or_else(|| "Could not determine config file path".to_string())?;
 
-    // Ensure the directory exists
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {}", e))?;
-    }
-
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-    fs::write(&path, json).map_err(|e| format!("Failed to write config file: {}", e))
+    crate::mdm::utils::write_atomic(&path, json.as_bytes())
+        .map_err(|e| format!("Failed to write config file: {}", e))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -1813,6 +2123,19 @@ fn apply_test_config_patch(config: &mut Config) {
                 );
             }
         }
+        if let Some(value) = patch.notes_ref {
+            config.notes_ref = parse_notes_ref(&value);
+        }
+        if let Some(value) = patch.notes_push {
+            config.notes_push = env::var("GIT_AI_NOTES_PUSH")
+                .ok()
+                .and_then(|value| NotesPush::parse(&value))
+                .unwrap_or(value);
+        }
+        if let Some(patterns) = patch.notes_push_repositories {
+            config.notes_push_repositories =
+                parse_path_patterns("notes_push_repositories", patterns);
+        }
         if let Some(nb) = patch.notes_backend {
             config.notes_backend.kind = nb.kind;
             if let Some(url) = nb.backend_url {
@@ -1875,6 +2198,9 @@ mod tests {
             git_ai_hooks: HashMap::new(),
             codex_hooks_format: CodexHooksFormat::ConfigToml,
             notes_backend: NotesBackendConfig::default(),
+            notes_ref: Ok(crate::git::refs::AI_AUTHORSHIP_REFNAME.to_string()),
+            notes_push: NotesPush::default(),
+            notes_push_repositories: vec![],
             transcript_streaming_lookback_days: Some(7),
             max_checkpoint_file_size_bytes: DEFAULT_MAX_CHECKPOINT_FILE_SIZE_BYTES,
             max_checkpoint_total_size_bytes: DEFAULT_MAX_CHECKPOINT_TOTAL_SIZE_BYTES,
@@ -2094,6 +2420,165 @@ mod tests {
 
     // Tests for exclude_prompts_in_repositories (blacklist)
 
+    /// An absolute path on every platform (`/x` is not absolute on Windows).
+    fn abs(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    #[test]
+    fn daemon_repo_roots_absent_or_empty_tracks_every_repo() {
+        for value in [None, Some(serde_json::json!([]))] {
+            let (roots, errors) = parse_daemon_repo_roots(value.as_ref());
+            assert!(!roots.is_active(), "{value:?}");
+            assert!(roots.allows(&abs("anything").join(".git")));
+            assert!(errors.is_empty());
+        }
+    }
+
+    #[test]
+    fn daemon_repo_roots_match_canonical_paths_by_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("clones");
+        fs::create_dir_all(real.join("a/.git")).unwrap();
+        fs::create_dir_all(real.join("ab/.git")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+
+        let mut listed = vec![real.join("a"), real.join("ab/../a")];
+        #[cfg(unix)]
+        listed.push(dir.path().join("link/a"));
+        for entry in listed {
+            let (roots, errors) =
+                parse_daemon_repo_roots(Some(&serde_json::json!([entry.clone()])));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(roots.allows(&real.join("a/.git")), "{entry:?}");
+            assert!(roots.allows(&real.join("a/.git/worktrees/w")), "{entry:?}");
+            assert!(!roots.allows(&real.join("ab/.git")), "{entry:?}");
+        }
+    }
+
+    #[test]
+    fn daemon_repo_roots_invalid_value_fails_closed_keeping_valid_entries() {
+        let managed = abs("managed");
+        let elsewhere = abs("elsewhere");
+
+        for value in [serde_json::json!(managed), serde_json::Value::Null] {
+            let (roots, errors) = parse_daemon_repo_roots(Some(&value));
+            assert!(roots.is_active());
+            assert!(!roots.allows(&managed.join(".git")), "{value:?}");
+            assert_eq!(errors.len(), 1);
+        }
+
+        let (roots, errors) =
+            parse_daemon_repo_roots(Some(&serde_json::json!([managed, "relative/clone", 7])));
+        assert!(roots.allows(&managed.join(".git")));
+        assert!(!roots.allows(&elsewhere.join(".git")));
+        assert_eq!(errors.len(), 2, "{errors:?}");
+
+        let (roots, errors) = parse_daemon_repo_roots(Some(&serde_json::json!(["relative"])));
+        assert!(roots.is_active());
+        assert!(!roots.allows(&elsewhere.join(".git")));
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn daemon_repo_roots_read_from_a_bom_prefixed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let managed = abs("managed");
+        let mut data = vec![0xEF, 0xBB, 0xBF];
+        data.extend(
+            serde_json::to_vec(&serde_json::json!({ "daemon_repo_roots": [managed] })).unwrap(),
+        );
+        fs::write(&path, data).unwrap();
+
+        let roots = load_daemon_repo_roots_cached(&path, &Mutex::new(None));
+
+        assert!(roots.allows(&managed.join(".git")));
+        assert!(!roots.allows(&abs("elsewhere").join(".git")));
+    }
+
+    #[test]
+    fn daemon_repo_roots_unparseable_config_fails_closed_only_when_it_names_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        fs::write(&path, r#"{"daemon_repo_roots": ["/tor"#).unwrap();
+        let roots = load_daemon_repo_roots_cached(&path, &Mutex::new(None));
+        assert!(roots.is_active());
+        assert!(!roots.allows(&abs("anything").join(".git")));
+
+        fs::write(&path, r#"{"notes_push": "nev"#).unwrap();
+        let roots = load_daemon_repo_roots_cached(&path, &Mutex::new(None));
+        assert!(!roots.is_active(), "no list named: track every repo (I2)");
+        assert!(roots.allows(&abs("anything").join(".git")));
+    }
+
+    #[test]
+    fn daemon_repo_roots_wrong_type_does_not_break_the_rest_of_the_file() {
+        let file: FileConfig =
+            serde_json::from_str(r#"{"daemon_repo_roots": "/x", "notes_push": "never"}"#).unwrap();
+        assert_eq!(file.daemon_repo_roots, Some(serde_json::json!("/x")));
+        assert_eq!(file.notes_push, Some(NotesPush::Never));
+    }
+
+    #[test]
+    fn daemon_repo_roots_cache_reloads_only_when_the_config_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let cache = Mutex::new(None);
+        // Same-length names, so only the mtime tells the two writes apart.
+        let (first, other) = (abs("first"), abs("other"));
+        let write = |roots: &serde_json::Value, secs: u64| {
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({ "daemon_repo_roots": roots })).unwrap(),
+            )
+            .unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        let allows =
+            |root: &Path| load_daemon_repo_roots_cached(&path, &cache).allows(&root.join(".git"));
+
+        assert!(!load_daemon_repo_roots_cached(&path, &cache).is_active());
+
+        write(&serde_json::json!([first]), 1_000);
+        assert!(allows(&first));
+        assert!(!allows(&other));
+
+        // Same mtime and size: the cached list stands though the content changed.
+        write(&serde_json::json!([other]), 1_000);
+        assert!(!allows(&other));
+
+        write(&serde_json::json!([other]), 1_001);
+        assert!(allows(&other));
+
+        // Another key's wrong type doesn't disable the list.
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "daemon_repo_roots": [first],
+                "notes_push": 7,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(allows(&first));
+        assert!(!allows(&other));
+
+        // A torn write keeps the last good list until the file changes again.
+        fs::write(&path, r#"{"daemon_repo_roots": ["/tor"#).unwrap();
+        assert!(allows(&first));
+        assert!(!allows(&other));
+        write(&serde_json::json!([other]), 1_002);
+        assert!(allows(&other));
+    }
+
     #[test]
     fn untraced_fixup_ignored_paths_parse_from_file_config_and_drop_invalid_globs() {
         let parsed = parse_path_patterns(
@@ -2143,6 +2628,9 @@ mod tests {
             git_ai_hooks: HashMap::new(),
             codex_hooks_format: CodexHooksFormat::ConfigToml,
             notes_backend: NotesBackendConfig::default(),
+            notes_ref: Ok(crate::git::refs::AI_AUTHORSHIP_REFNAME.to_string()),
+            notes_push: NotesPush::default(),
+            notes_push_repositories: vec![],
             transcript_streaming_lookback_days: Some(7),
             max_checkpoint_file_size_bytes: DEFAULT_MAX_CHECKPOINT_FILE_SIZE_BYTES,
             max_checkpoint_total_size_bytes: DEFAULT_MAX_CHECKPOINT_TOTAL_SIZE_BYTES,
@@ -2293,6 +2781,9 @@ mod tests {
             git_ai_hooks: HashMap::new(),
             codex_hooks_format: CodexHooksFormat::ConfigToml,
             notes_backend: NotesBackendConfig::default(),
+            notes_ref: Ok(crate::git::refs::AI_AUTHORSHIP_REFNAME.to_string()),
+            notes_push: NotesPush::default(),
+            notes_push_repositories: vec![],
             transcript_streaming_lookback_days: Some(7),
             max_checkpoint_file_size_bytes: DEFAULT_MAX_CHECKPOINT_FILE_SIZE_BYTES,
             max_checkpoint_total_size_bytes: DEFAULT_MAX_CHECKPOINT_TOTAL_SIZE_BYTES,

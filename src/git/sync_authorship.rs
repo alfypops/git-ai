@@ -1,6 +1,8 @@
+// Modified by alfypops, 2026: central authorship notes namespace.
+// Modified by alfypops, 2026: local-only notes push option
 use crate::git::refs::{
-    AI_AUTHORSHIP_PUSH_REFSPEC, copy_ref, fallback_merge_notes_ours, merge_notes_from_ref,
-    ref_exists, tracking_ref_for_remote,
+    AuthorshipNotesRef, authorship_notes_ref, copy_ref, fallback_merge_notes_ours_into,
+    merge_notes_from_ref_into, ref_exists,
 };
 use crate::{
     error::GitAiError,
@@ -116,16 +118,29 @@ pub fn fetch_missing_notes_for_commits(
     repository: &Repository,
     source_commits: &[String],
 ) -> Result<(), GitAiError> {
+    fetch_missing_notes_for_commits_into(repository, source_commits, &authorship_notes_ref()?)
+}
+
+pub(crate) fn fetch_missing_notes_for_commits_into(
+    repository: &Repository,
+    source_commits: &[String],
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<(), GitAiError> {
     use std::collections::HashSet;
 
-    fn noted_commits(repository: &Repository, commit_shas: &[String]) -> HashSet<String> {
+    fn noted_commits(
+        repository: &Repository,
+        commit_shas: &[String],
+        notes_ref: &AuthorshipNotesRef,
+    ) -> HashSet<String> {
         // Backend-aware presence check: on the HTTP backend notes live in the
-        // notes-db cache, not refs/notes/ai — without this, every rewrite of
+        // notes-db cache, not the configured authorship ref — without this, every rewrite of
         // cached-note commits triggered pointless notes fetches from all remotes.
-        crate::git::notes_api::commits_with_notes(repository, commit_shas).unwrap_or_default()
+        crate::git::notes_api::commits_with_notes_from_ref(repository, commit_shas, notes_ref)
+            .unwrap_or_default()
     }
 
-    let noted_before_fetch = noted_commits(repository, source_commits);
+    let noted_before_fetch = noted_commits(repository, source_commits, notes_ref);
 
     let missing: Vec<&String> = source_commits
         .iter()
@@ -136,7 +151,7 @@ pub fn fetch_missing_notes_for_commits(
         return Ok(());
     }
 
-    // On the HTTP notes backend the server — not refs/notes/ai — is the
+    // On the HTTP notes backend the server — not the configured authorship ref — is the
     // source of truth: pull the missing source notes straight from it into
     // the local cache first. The git refs fetch below requires working SSH
     // auth in the daemon's environment and only helps repos whose notes live
@@ -167,7 +182,7 @@ pub fn fetch_missing_notes_for_commits(
     if let Ok(remotes) = repository.remotes_with_urls() {
         for (remote_name, _) in remotes {
             tracing::debug!("Attempting safe notes fetch from remote {}", remote_name);
-            match fetch_authorship_notes(repository, &remote_name) {
+            match fetch_authorship_notes_into(repository, &remote_name, notes_ref) {
                 Ok(_) => tracing::debug!("Fetched and merged notes from remote {}", remote_name),
                 Err(e) => {
                     tracing::debug!("Notes fetch from remote {} failed: {}", remote_name, e);
@@ -180,7 +195,7 @@ pub fn fetch_missing_notes_for_commits(
     }
 
     if let Some(error) = first_fetch_error {
-        let noted_after_fetch = noted_commits(repository, source_commits);
+        let noted_after_fetch = noted_commits(repository, source_commits, notes_ref);
         let still_missing: Vec<&String> = source_commits
             .iter()
             .filter(|sha| !noted_after_fetch.contains(sha.as_str()))
@@ -205,7 +220,21 @@ pub fn fetch_missing_notes_for_commits_best_effort(
     repository: &Repository,
     source_commits: &[String],
 ) {
-    if let Err(error) = fetch_missing_notes_for_commits(repository, source_commits) {
+    match authorship_notes_ref() {
+        Ok(notes_ref) => {
+            fetch_missing_notes_for_commits_best_effort_into(repository, source_commits, &notes_ref)
+        }
+        Err(error) => tracing::warn!(%error, "source-note fetch skipped: invalid notes namespace"),
+    }
+}
+
+pub(crate) fn fetch_missing_notes_for_commits_best_effort_into(
+    repository: &Repository,
+    source_commits: &[String],
+    notes_ref: &AuthorshipNotesRef,
+) {
+    if let Err(error) = fetch_missing_notes_for_commits_into(repository, source_commits, notes_ref)
+    {
         tracing::warn!(
             %error,
             "source-note fetch failed; shifting the notes that are available locally"
@@ -221,8 +250,16 @@ pub fn fetch_authorship_notes(
     repository: &Repository,
     remote_name: &str,
 ) -> Result<NotesExistence, GitAiError> {
+    fetch_authorship_notes_into(repository, remote_name, &authorship_notes_ref()?)
+}
+
+pub(crate) fn fetch_authorship_notes_into(
+    repository: &Repository,
+    remote_name: &str,
+    notes_ref: &AuthorshipNotesRef,
+) -> Result<NotesExistence, GitAiError> {
     // Generate tracking ref for this remote
-    let tracking_ref = tracking_ref_for_remote(remote_name);
+    let tracking_ref = notes_ref.tracking(remote_name);
 
     tracing::info!(
         remote = %remote_name,
@@ -237,8 +274,8 @@ pub fn fetch_authorship_notes(
     );
 
     // Fetch notes to tracking ref with explicit refspec.
-    // If the remote does not have refs/notes/ai yet, treat that as NotFound.
-    let fetch_refspec = format!("+refs/notes/ai:{}", tracking_ref);
+    // If the remote does not have the configured authorship ref yet, treat that as NotFound.
+    let fetch_refspec = format!("+{}:{}", notes_ref.full, tracking_ref);
 
     // Build the internal authorship fetch with explicit flags and disabled hooks.
     // IMPORTANT: use repository.global_args_for_exec() to ensure -C flag is present for bare repos.
@@ -262,7 +299,7 @@ pub fn fetch_authorship_notes(
             );
         }
         Err(e) => {
-            if is_missing_remote_notes_ref_error(&e) {
+            if is_missing_remote_notes_ref_error(&e, notes_ref) {
                 tracing::debug!(
                     "no authorship notes found on remote '{}', nothing to sync",
                     remote_name
@@ -274,8 +311,8 @@ pub fn fetch_authorship_notes(
         }
     }
 
-    // After successful fetch, merge the tracking ref into refs/notes/ai
-    let local_notes_ref = "refs/notes/ai";
+    // After successful fetch, merge the tracking ref into the configured authorship ref
+    let local_notes_ref = notes_ref.full.as_str();
 
     if crate::git::refs::ref_exists(repository, &tracking_ref) {
         if crate::git::refs::ref_exists(repository, local_notes_ref) {
@@ -285,10 +322,12 @@ pub fn fetch_authorship_notes(
                 tracking_ref,
                 local_notes_ref
             );
-            if let Err(e) = merge_notes_from_ref(repository, &tracking_ref) {
+            if let Err(e) = merge_notes_from_ref_into(repository, &tracking_ref, notes_ref) {
                 tracing::debug!("notes merge failed: {}", e);
                 // Fallback: manually merge notes when git notes merge crashes
-                if let Err(e2) = fallback_merge_notes_ours(repository, &tracking_ref) {
+                if let Err(e2) =
+                    fallback_merge_notes_ours_into(repository, &tracking_ref, notes_ref)
+                {
                     tracing::debug!("fallback merge also failed: {}", e2);
                     return Err(e2);
                 }
@@ -312,13 +351,13 @@ pub fn fetch_authorship_notes(
     Ok(NotesExistence::Found)
 }
 
-fn is_missing_remote_notes_ref_error(error: &GitAiError) -> bool {
+fn is_missing_remote_notes_ref_error(error: &GitAiError, notes_ref: &AuthorshipNotesRef) -> bool {
     let GitAiError::GitCliError { stderr, .. } = error else {
         return false;
     };
 
     let stderr_lower = stderr.to_ascii_lowercase();
-    stderr_lower.contains("refs/notes/ai")
+    stderr_lower.contains(&notes_ref.full.to_ascii_lowercase())
         && (stderr_lower.contains("couldn't find remote ref")
             || stderr_lower.contains("could not find remote ref")
             || stderr_lower.contains("remote ref does not exist")
@@ -329,15 +368,166 @@ fn is_missing_remote_notes_ref_error(error: &GitAiError) -> bool {
 /// even after a successful merge, so we retry the full cycle.
 const PUSH_NOTES_MAX_ATTEMPTS: usize = 3;
 
-// for use with post-push hook
-pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Result<(), GitAiError> {
-    // Belt-and-suspenders: when the HTTP backend is active, notes are not stored
-    // in refs/notes/ai so there is nothing to push.
-    if crate::config::Config::get().notes_backend_kind() == crate::config::NotesBackendKind::Http {
-        tracing::debug!("push_authorship_notes: skipping refs/notes/ai push (Http backend active)");
-        return Ok(());
+/// Outcome shared with the machine CLI, without repeating the policy check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotesPushDecision {
+    Allowed,
+    Skipped(&'static str),
+}
+
+/// A single native snapshot includes active conditional config and URL aliases.
+struct NotesPushGitConfig {
+    entries: Vec<(String, String)>,
+}
+
+impl NotesPushGitConfig {
+    fn load(repository: &Repository) -> Result<Self, GitAiError> {
+        let mut args = repository.global_args_for_exec();
+        args.extend(["config", "--null", "--list", "--includes"].map(String::from));
+        let config = String::from_utf8(exec_git(&args)?.stdout)?;
+        let entries = config
+            .split('\0')
+            .filter_map(|entry| {
+                let (name, value) = entry.split_once('\n')?;
+                (name.starts_with("url.") || name.starts_with("remote."))
+                    .then(|| (name.to_string(), value.to_string()))
+            })
+            .collect();
+        Ok(Self { entries })
     }
 
+    fn rewrite(&self, url: &str, key: &str) -> Option<String> {
+        let mut best: Option<(usize, String)> = None;
+        for (name, prefix) in &self.entries {
+            let Some((base, property)) = name
+                .strip_prefix("url.")
+                .and_then(|name| name.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if property.eq_ignore_ascii_case(key)
+                && let Some(suffix) = url.strip_prefix(prefix.as_str())
+                && best.as_ref().is_none_or(|(len, _)| prefix.len() > *len)
+            {
+                best = Some((prefix.len(), format!("{}{}", base, suffix)));
+            }
+        }
+        best.map(|(_, url)| url)
+    }
+
+    fn fetch_url(&self, url: &str) -> String {
+        self.rewrite(url, "insteadOf")
+            .unwrap_or_else(|| url.to_string())
+    }
+
+    fn literal_push_url(&self, url: &str) -> String {
+        self.rewrite(url, "pushInsteadOf")
+            .unwrap_or_else(|| self.fetch_url(url))
+    }
+
+    fn remote_values(&self, remote: &str, property: &str) -> Vec<&str> {
+        let key = format!("remote.{}.{}", remote, property);
+        let mut values = Vec::new();
+        for (_, value) in self.entries.iter().filter(|(name, _)| name == &key) {
+            if value.is_empty() {
+                values.clear();
+            } else {
+                values.push(value.as_str());
+            }
+        }
+        values
+    }
+
+    fn push_urls(&self, remote: &str) -> Vec<String> {
+        let explicit = self.remote_values(remote, "pushurl");
+        if !explicit.is_empty() {
+            return explicit
+                .into_iter()
+                .map(|url| self.fetch_url(url))
+                .collect();
+        }
+        let urls = self.remote_values(remote, "url");
+        if urls.is_empty() {
+            return vec![self.literal_push_url(remote)];
+        }
+        let aliases: Vec<_> = urls
+            .iter()
+            .filter_map(|url| self.rewrite(url, "pushInsteadOf"))
+            .collect();
+        if !aliases.is_empty() {
+            aliases
+        } else {
+            urls.into_iter().map(|url| self.fetch_url(url)).collect()
+        }
+    }
+
+    fn repository_identities(&self) -> Vec<(String, String)> {
+        let names: std::collections::BTreeSet<_> = self
+            .entries
+            .iter()
+            .filter_map(|(key, _)| {
+                let (name, property) = key.strip_prefix("remote.")?.rsplit_once('.')?;
+                matches!(property, "url" | "pushurl").then_some(name)
+            })
+            .collect();
+        let mut identities = Vec::new();
+        for name in names {
+            for url in self
+                .remote_values(name, "url")
+                .into_iter()
+                .chain(self.remote_values(name, "pushurl"))
+            {
+                identities.push((name.to_string(), url.to_string()));
+                identities.push((name.to_string(), self.fetch_url(url)));
+            }
+            identities.extend(
+                self.push_urls(name)
+                    .into_iter()
+                    .map(|url| (name.to_string(), url)),
+            );
+        }
+        identities
+    }
+}
+
+/// Read fresh policy and one native Git snapshot for all repository identities.
+pub fn notes_push_allowed(
+    repository: &Repository,
+    remote: &str,
+) -> Result<NotesPushDecision, GitAiError> {
+    let config = match crate::config::Config::fresh_for_notes_push() {
+        Ok(config) => config,
+        Err(reason) => return Ok(NotesPushDecision::Skipped(reason)),
+    };
+    if let Err(error) = authorship_notes_ref() {
+        tracing::warn!(%error, "authorship push skipped until process restart");
+        return Ok(NotesPushDecision::Skipped("invalid notes_ref"));
+    }
+    if config.notes_backend_kind() == crate::config::NotesBackendKind::Http {
+        return Ok(NotesPushDecision::Skipped("Http backend active"));
+    }
+    let git_config = NotesPushGitConfig::load(repository)?;
+    let identities = git_config.repository_identities();
+    for url in git_config.push_urls(remote) {
+        if let Some(reason) = config.notes_push_skip_reason(&identities, &url) {
+            return Ok(NotesPushDecision::Skipped(reason));
+        }
+    }
+    Ok(NotesPushDecision::Allowed)
+}
+
+// for use with post-push hook
+pub fn push_authorship_notes(
+    repository: &Repository,
+    remote_name: &str,
+) -> Result<NotesPushDecision, GitAiError> {
+    let decision = notes_push_allowed(repository, remote_name)?;
+    if let NotesPushDecision::Skipped(reason) = decision {
+        tracing::debug!("push_authorship_notes: skipped: {}", reason);
+        return Ok(decision);
+    }
+
+    let notes_ref = authorship_notes_ref()?;
     let mut last_error = None;
 
     for attempt in 0..PUSH_NOTES_MAX_ATTEMPTS {
@@ -349,15 +539,16 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
             );
         }
 
-        fetch_and_merge_tracking_notes(repository, remote_name);
+        fetch_and_merge_tracking_notes(repository, remote_name, &notes_ref);
 
         // Push notes without force (requires fast-forward)
-        let push_args = build_authorship_push_args(repository.global_args_for_exec(), remote_name);
+        let push_args =
+            build_authorship_push_args(repository.global_args_for_exec(), remote_name, &notes_ref);
 
         tracing::debug!("pushing authorship refs (no force): {:?}", &push_args);
 
         match exec_git(&push_args) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(NotesPushDecision::Allowed),
             Err(e) => {
                 tracing::debug!("authorship push failed: {}", e);
                 if is_non_fast_forward_error(&e) && attempt + 1 < PUSH_NOTES_MAX_ATTEMPTS {
@@ -375,10 +566,14 @@ pub fn push_authorship_notes(repository: &Repository, remote_name: &str) -> Resu
         .unwrap_or_else(|| GitAiError::Generic("notes push exhausted retries".to_string())))
 }
 
-/// Fetch remote notes into a tracking ref and merge into local refs/notes/ai.
-fn fetch_and_merge_tracking_notes(repository: &Repository, remote_name: &str) {
-    let tracking_ref = tracking_ref_for_remote(remote_name);
-    let fetch_refspec = format!("+refs/notes/ai:{}", tracking_ref);
+/// Fetch remote notes into a tracking ref and merge into the configured local authorship ref.
+fn fetch_and_merge_tracking_notes(
+    repository: &Repository,
+    remote_name: &str,
+    notes_ref: &AuthorshipNotesRef,
+) {
+    let tracking_ref = notes_ref.tracking(remote_name);
+    let fetch_refspec = format!("+{}:{}", notes_ref.full, tracking_ref);
 
     let fetch_args = build_authorship_fetch_args(
         repository.global_args_for_exec(),
@@ -393,7 +588,7 @@ fn fetch_and_merge_tracking_notes(repository: &Repository, remote_name: &str) {
         return;
     }
 
-    let local_notes_ref = "refs/notes/ai";
+    let local_notes_ref = notes_ref.full.as_str();
 
     if !ref_exists(repository, &tracking_ref) {
         return;
@@ -418,12 +613,12 @@ fn fetch_and_merge_tracking_notes(repository: &Repository, remote_name: &str) {
         tracking_ref,
         local_notes_ref
     );
-    if let Err(e) = merge_notes_from_ref(repository, &tracking_ref) {
+    if let Err(e) = merge_notes_from_ref_into(repository, &tracking_ref, notes_ref) {
         tracing::debug!("pre-push notes merge failed: {}", e);
         // Fallback: manually merge notes when git notes merge crashes
         // (e.g., due to corrupted/mixed-fanout notes trees, or git bugs
         // with fanout-level mismatches on older git versions like macOS)
-        if let Err(e2) = fallback_merge_notes_ours(repository, &tracking_ref) {
+        if let Err(e2) = fallback_merge_notes_ours_into(repository, &tracking_ref, notes_ref) {
             tracing::debug!("pre-push fallback merge also failed: {}", e2);
         }
     }
@@ -510,7 +705,11 @@ fn build_authorship_fetch_args(
     args
 }
 
-fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Vec<String> {
+fn build_authorship_push_args(
+    global_args: Vec<String>,
+    remote_name: &str,
+    notes_ref: &AuthorshipNotesRef,
+) -> Vec<String> {
     let mut args = with_disabled_hooks(global_args);
     args.push("push".to_string());
     args.push("--quiet".to_string());
@@ -518,7 +717,7 @@ fn build_authorship_push_args(global_args: Vec<String>, remote_name: &str) -> Ve
     args.push("--no-verify".to_string());
     args.push("--no-signed".to_string());
     args.push(remote_name.to_string());
-    args.push(AI_AUTHORSHIP_PUSH_REFSPEC.to_string());
+    args.push(notes_ref.push_refspec());
     args
 }
 
@@ -647,7 +846,11 @@ mod tests {
         let args = build_authorship_fetch_args(
             vec!["-C".to_string(), "/tmp/repo".to_string()],
             "origin",
-            "+refs/notes/ai:refs/notes/ai-remote/origin",
+            &format!(
+                "+{}:{}",
+                authorship_notes_ref().unwrap().full,
+                authorship_notes_ref().unwrap().tracking("origin")
+            ),
         );
 
         assert!(
@@ -660,8 +863,11 @@ mod tests {
     #[test]
     fn authorship_push_args_always_disable_hooks() {
         let disabled_hooks = disabled_hooks_config();
-        let args =
-            build_authorship_push_args(vec!["-C".to_string(), "/tmp/repo".to_string()], "origin");
+        let args = build_authorship_push_args(
+            vec!["-C".to_string(), "/tmp/repo".to_string()],
+            "origin",
+            &authorship_notes_ref().unwrap(),
+        );
 
         assert!(
             args.windows(2)
@@ -696,10 +902,16 @@ mod tests {
     fn missing_remote_notes_ref_error_is_detected() {
         let err = GitAiError::GitCliError {
             code: Some(128),
-            stderr: "fatal: couldn't find remote ref refs/notes/ai".to_string(),
+            stderr: format!(
+                "fatal: couldn't find remote ref {}",
+                authorship_notes_ref().unwrap().full
+            ),
             args: vec!["fetch".to_string(), "origin".to_string()],
         };
-        assert!(is_missing_remote_notes_ref_error(&err));
+        assert!(is_missing_remote_notes_ref_error(
+            &err,
+            &authorship_notes_ref().unwrap()
+        ));
     }
 
     #[test]
@@ -710,6 +922,9 @@ mod tests {
                 .to_string(),
             args: vec!["fetch".to_string(), "origin".to_string()],
         };
-        assert!(!is_missing_remote_notes_ref_error(&err));
+        assert!(!is_missing_remote_notes_ref_error(
+            &err,
+            &authorship_notes_ref().unwrap()
+        ));
     }
 }

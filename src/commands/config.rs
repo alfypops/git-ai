@@ -1,8 +1,13 @@
+// Modified by alfypops, 2026: configurable authorship notes namespace.
+// Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: daemon_repo_roots config key.
 use dirs;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::config::{AuthorConfig, CodexHooksFormat, MAX_DAEMON_MEMORY_LIMIT_MB, NotesBackendKind};
+use crate::config::{
+    AuthorConfig, CodexHooksFormat, MAX_DAEMON_MEMORY_LIMIT_MB, NotesBackendKind, NotesPush,
+};
 use crate::git::repository::find_repository_in_path;
 
 /// Determines the type of pattern value provided
@@ -101,8 +106,18 @@ fn print_config_help() {
     println!("  exclude_prompts_in_repositories  Repos to exclude prompts from (array)");
     println!("  allow_repositories           Allowed repos (array)");
     println!("  exclude_repositories         Excluded repos (array)");
+    println!("  notes_ref                    Authorship notes ref component (default: ai)");
+    println!(
+        "  notes_push                   Push notes: always (default) or never; GIT_AI_NOTES_PUSH overrides"
+    );
+    println!(
+        "  notes_push_repositories      Destination URL globs allowed when notes_push is never (array)"
+    );
     println!(
         "  untraced_fixup_ignored_paths Repo path globs the untraced-commit fixup skips (array)"
+    );
+    println!(
+        "  daemon_repo_roots            Absolute paths; the daemon only tracks repos whose git common dir is under one (array, empty = all)"
     );
     println!("  telemetry_oss                OSS telemetry setting (on/off)");
     println!("  telemetry_enterprise_dsn     Enterprise telemetry DSN");
@@ -294,6 +309,23 @@ fn show_all_config() -> Result<(), String> {
         effective_config.insert("allow_repositories".to_string(), Value::Array(vec![]));
     }
 
+    effective_config.insert(
+        "notes_ref".to_string(),
+        serde_json::to_value(
+            crate::git::refs::authorship_notes_ref()
+                .map_err(|error| error.to_string())?
+                .name,
+        )
+        .unwrap(),
+    );
+    effective_config.insert(
+        "notes_push".to_string(),
+        serde_json::to_value(runtime_config.notes_push()).unwrap(),
+    );
+    effective_config.insert(
+        "notes_push_repositories".to_string(),
+        serde_json::to_value(runtime_config.notes_push_repositories()).unwrap(),
+    );
     if let Some(ref repos) = file_config.exclude_repositories {
         effective_config.insert(
             "exclude_repositories".to_string(),
@@ -312,6 +344,13 @@ fn show_all_config() -> Result<(), String> {
                 .unwrap_or_default(),
         )
         .unwrap(),
+    );
+    effective_config.insert(
+        "daemon_repo_roots".to_string(),
+        file_config
+            .daemon_repo_roots
+            .clone()
+            .unwrap_or_else(|| Value::Array(vec![])),
     );
 
     // Booleans with runtime values
@@ -486,8 +525,22 @@ fn get_config_value(key: &str) -> Result<(), String> {
                     Value::Array(vec![])
                 }
             }
+            "notes_ref" => serde_json::to_value(
+                crate::git::refs::authorship_notes_ref()
+                    .map_err(|error| error.to_string())?
+                    .name,
+            )
+            .unwrap(),
+            "notes_push" => serde_json::to_value(runtime_config.notes_push()).unwrap(),
             "exclude_repositories" => {
                 if let Some(ref repos) = file_config.exclude_repositories {
+                    serde_json::to_value(repos).unwrap()
+                } else {
+                    Value::Array(vec![])
+                }
+            }
+            "notes_push_repositories" => {
+                if let Some(ref repos) = file_config.notes_push_repositories {
                     serde_json::to_value(repos).unwrap()
                 } else {
                     Value::Array(vec![])
@@ -500,6 +553,10 @@ fn get_config_value(key: &str) -> Result<(), String> {
                     .unwrap_or_default(),
             )
             .unwrap(),
+            "daemon_repo_roots" => file_config
+                .daemon_repo_roots
+                .clone()
+                .unwrap_or_else(|| Value::Array(vec![])),
             "telemetry_oss_disabled" => Value::Bool(runtime_config.is_telemetry_oss_disabled()),
             "telemetry_enterprise_dsn" => {
                 if let Some(ref dsn) = file_config.telemetry_enterprise_dsn {
@@ -724,12 +781,58 @@ fn set_config_value(key: &str, value: &str, add_mode: bool) -> Result<(), String
                 crate::config::save_file_config(&file_config)?;
                 log_array_changes(&added, add_mode);
             }
+            "notes_ref" => {
+                crate::config::validate_notes_ref(value)?;
+                file_config.notes_ref = Some(serde_json::Value::String(value.to_string()));
+                crate::config::save_file_config(&file_config)?;
+                println!("[notes_ref]: {}", value);
+                println!(
+                    "Applies to new git-ai processes; restart the daemon with `git-ai bg restart`."
+                );
+            }
+            "notes_push" => {
+                let mode = NotesPush::parse(value).ok_or_else(|| {
+                    format!(
+                        "Invalid notes_push '{}'. Expected 'always' or 'never'",
+                        value
+                    )
+                })?;
+                file_config.notes_push = Some(mode);
+                crate::config::save_file_config(&file_config)?;
+                println!("[notes_push]: {}", mode.as_str());
+            }
+            "notes_push_repositories" => {
+                let added = set_string_array_field(
+                    &mut file_config.notes_push_repositories,
+                    value,
+                    add_mode,
+                )?;
+                crate::config::save_file_config(&file_config)?;
+                log_array_changes(&added, add_mode);
+            }
             "untraced_fixup_ignored_paths" => {
                 let added = set_string_array_field(
                     &mut file_config.untraced_fixup_ignored_paths,
                     value,
                     add_mode,
                 )?;
+                crate::config::save_file_config(&file_config)?;
+                log_array_changes(&added, add_mode);
+            }
+            "daemon_repo_roots" => {
+                let mut roots = match file_config.daemon_repo_roots.take() {
+                    Some(existing) if add_mode => {
+                        Some(serde_json::from_value::<Vec<String>>(existing).map_err(|_| {
+                            "Existing daemon_repo_roots is not an array of paths; replace it with `git-ai config set daemon_repo_roots`".to_string()
+                        })?)
+                    }
+                    _ => None,
+                };
+                let added = set_string_array_field(&mut roots, value, add_mode)?;
+                for root in &added {
+                    crate::config::validate_daemon_repo_root(root)?;
+                }
+                file_config.daemon_repo_roots = roots.map(Value::from);
                 crate::config::save_file_config(&file_config)?;
                 log_array_changes(&added, add_mode);
             }
@@ -1146,10 +1249,37 @@ fn unset_config_value(key: &str) -> Result<(), String> {
                     log_array_removals(&items);
                 }
             }
+            "notes_ref" => {
+                file_config.notes_ref = None;
+                crate::config::save_file_config(&file_config)?;
+            }
+            "notes_push" => {
+                let old = file_config.notes_push.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(old) = old {
+                    println!("- [notes_push]: {}", old.as_str());
+                }
+            }
+            "notes_push_repositories" => {
+                let old_values = file_config.notes_push_repositories.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(items) = old_values {
+                    log_array_removals(&items);
+                }
+            }
             "untraced_fixup_ignored_paths" => {
                 let old_values = file_config.untraced_fixup_ignored_paths.take();
                 crate::config::save_file_config(&file_config)?;
                 if let Some(items) = old_values {
+                    log_array_removals(&items);
+                }
+            }
+            "daemon_repo_roots" => {
+                let old_values = file_config.daemon_repo_roots.take();
+                crate::config::save_file_config(&file_config)?;
+                if let Some(items) =
+                    old_values.and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                {
                     log_array_removals(&items);
                 }
             }

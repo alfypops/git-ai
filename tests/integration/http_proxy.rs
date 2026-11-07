@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::repos::test_repo::TestRepo;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -96,9 +97,35 @@ fn proxy_env<'a>(proxy_url: &'a str, no_proxy: &'a str) -> [(&'a str, &'a str); 
     ]
 }
 
+// This fork is managed by CodeSense. Keep the upstream proxy assertions below
+// for upstream versions, and verify the fork never reaches either endpoint.
+fn assert_fork_upgrade_refuses_without_network(repo: &TestRepo) -> bool {
+    if !env!("CARGO_PKG_VERSION").contains("-cs.") {
+        return false;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let mut env = proxy_env("", "127.0.0.1");
+    env[8] = ("GIT_AI_API_BASE_URL", &url);
+    let output = repo.git_ai_with_env(&["upgrade"], &env);
+    assert_eq!(
+        output.unwrap_err().trim(),
+        "this is the alfypops build of git-ai; it is updated by CodeSense"
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    true
+}
+
 #[test]
 fn upgrade_uses_http_proxy_from_environment() {
     let repo = TestRepo::new();
+    if assert_fork_upgrade_refuses_without_network(&repo) {
+        return;
+    }
     let proxy = OneShotHttpServer::start(RELEASES_RESPONSE);
     let proxy_url = proxy.url();
 
@@ -121,6 +148,9 @@ fn upgrade_uses_http_proxy_from_environment() {
 #[test]
 fn upgrade_respects_no_proxy_from_environment() {
     let repo = TestRepo::new();
+    if assert_fork_upgrade_refuses_without_network(&repo) {
+        return;
+    }
     let target = OneShotHttpServer::start(RELEASES_RESPONSE);
     let unavailable_proxy = TcpListener::bind("127.0.0.1:0").unwrap();
     let proxy_url = format!("http://{}", unavailable_proxy.local_addr().unwrap());
@@ -142,6 +172,9 @@ fn upgrade_respects_no_proxy_from_environment() {
 #[test]
 fn upgrade_accepts_response_larger_than_ureq_default_limit() {
     let repo = TestRepo::new();
+    if assert_fork_upgrade_refuses_without_network(&repo) {
+        return;
+    }
     let mut response = RELEASES_RESPONSE.as_bytes().to_vec();
     response.resize(11 * 1024 * 1024, b' ');
     let target = OneShotHttpServer::start(response);

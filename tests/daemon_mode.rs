@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 #[macro_use]
 #[path = "integration/repos/mod.rs"]
 mod repos;
@@ -167,33 +168,6 @@ fn wait_for_test_side_effect_delay_started(repo: &TestRepo) {
 
 fn repo_workdir_string(repo: &TestRepo) -> String {
     repo.path().to_string_lossy().to_string()
-}
-
-struct ScopedEnvVar {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(previous) = self.previous.as_ref() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
 }
 
 struct MockApiServer {
@@ -867,12 +841,12 @@ fn claude_fixture_path() -> PathBuf {
 
 fn assert_post_commit_uploads_prompt_cas() {
     let mock_api = MockApiServer::start();
-    let _api_base_url = ScopedEnvVar::set("GIT_AI_API_BASE_URL", mock_api.base_url());
-    let _api_key = ScopedEnvVar::set("GIT_AI_API_KEY", "test-api-key");
-
-    // These tests depend on per-test API env vars being visible to the daemon.
-    // A shared daemon may already be running from an earlier test with different env.
-    let mut repo = TestRepo::new_with_daemon_scope(DaemonTestScope::Dedicated);
+    let daemon_env = [
+        ("GIT_AI_API_BASE_URL", mock_api.base_url()),
+        ("GIT_AI_API_KEY", "test-api-key"),
+        ("GIT_AI_NOTES_BACKEND_KIND", "git_notes"),
+    ];
+    let mut repo = TestRepo::new_with_daemon_env(&daemon_env);
     repo.patch_git_ai_config(|patch| {
         patch.exclude_prompts_in_repositories = Some(vec![]);
         patch.prompt_storage = Some("default".to_string());
@@ -882,7 +856,7 @@ fn assert_post_commit_uploads_prompt_cas() {
             backend_url: None,
         });
     });
-    repo.restart_dedicated_daemon_with_env_for_test(&[("GIT_AI_NOTES_BACKEND_KIND", "git_notes")]);
+    repo.restart_dedicated_daemon_with_env_for_test(&daemon_env);
 
     let repo_root = repo.canonical_path();
     let file_path = repo_root.join("test.ts");

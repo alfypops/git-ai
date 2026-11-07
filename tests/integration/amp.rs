@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: local-only notes push option
 use crate::test_utils::fixture_path;
 use git_ai::commands::checkpoint_agent::presets::{ParsedHookEvent, resolve_preset};
 use git_ai::streams::agent::Agent;
@@ -180,9 +181,10 @@ fn test_amp_e2e_checkpoint_and_commit() {
     let temp_threads = tempfile::tempdir().unwrap();
     copy_dir_all(&amp_threads_fixture_path(), temp_threads.path()).unwrap();
 
-    unsafe {
-        std::env::set_var("GIT_AI_AMP_THREADS_PATH", temp_threads.path());
-    }
+    let fixture_env = [(
+        "GIT_AI_AMP_THREADS_PATH",
+        temp_threads.path().to_str().unwrap(),
+    )];
 
     let pre_hook_input = json!({
         "hook_event_name": "PreToolUse",
@@ -194,8 +196,11 @@ fn test_amp_e2e_checkpoint_and_commit() {
         }
     })
     .to_string();
-    repo.git_ai(&["checkpoint", "amp", "--hook-input", &pre_hook_input])
-        .unwrap();
+    repo.git_ai_with_env(
+        &["checkpoint", "amp", "--hook-input", &pre_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     fs::write(&file_path, "// initial\n// Hello from amp\n").unwrap();
 
@@ -209,12 +214,11 @@ fn test_amp_e2e_checkpoint_and_commit() {
         }
     })
     .to_string();
-    repo.git_ai(&["checkpoint", "amp", "--hook-input", &post_hook_input])
-        .unwrap();
-
-    unsafe {
-        std::env::remove_var("GIT_AI_AMP_THREADS_PATH");
-    }
+    repo.git_ai_with_env(
+        &["checkpoint", "amp", "--hook-input", &post_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     let commit = repo.stage_all_and_commit("Add amp-authored line").unwrap();
 
@@ -257,9 +261,10 @@ fn test_amp_post_commit_resyncs_latest_thread_transcript() {
         .path()
         .join(format!("{}.json", AMP_SIMPLE_THREAD_ID));
 
-    unsafe {
-        std::env::set_var("GIT_AI_AMP_THREADS_PATH", temp_threads.path());
-    }
+    let fixture_env = [(
+        "GIT_AI_AMP_THREADS_PATH",
+        temp_threads.path().to_str().unwrap(),
+    )];
 
     let pre_hook_input = json!({
         "hook_event_name": "PreToolUse",
@@ -268,8 +273,11 @@ fn test_amp_post_commit_resyncs_latest_thread_transcript() {
         "edited_filepaths": [file_path.to_string_lossy().to_string()]
     })
     .to_string();
-    repo.git_ai(&["checkpoint", "amp", "--hook-input", &pre_hook_input])
-        .unwrap();
+    repo.git_ai_with_env(
+        &["checkpoint", "amp", "--hook-input", &pre_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     fs::write(&file_path, "// initial\n// ai edit\n").unwrap();
 
@@ -280,17 +288,16 @@ fn test_amp_post_commit_resyncs_latest_thread_transcript() {
         "edited_filepaths": [file_path.to_string_lossy().to_string()]
     })
     .to_string();
-    repo.git_ai(&["checkpoint", "amp", "--hook-input", &post_hook_input])
-        .unwrap();
+    repo.git_ai_with_env(
+        &["checkpoint", "amp", "--hook-input", &post_hook_input],
+        &fixture_env,
+    )
+    .unwrap();
 
     append_assistant_message(
         &thread_path,
         "RESYNC_TEST_MESSAGE: This message was appended after checkpoint",
     );
-
-    unsafe {
-        std::env::remove_var("GIT_AI_AMP_THREADS_PATH");
-    }
 
     let commit = repo
         .stage_all_and_commit("Commit with amp transcript resync")
