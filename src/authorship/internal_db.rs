@@ -3,7 +3,6 @@
 // It has been superseded by use-case-specific databases.
 
 use crate::error::GitAiError;
-use dirs;
 use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::PathBuf;

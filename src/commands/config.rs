@@ -2,7 +2,6 @@
 // Modified by alfypops, 2026: local-only notes push option
 // Modified by alfypops, 2026: daemon_repo_roots config key.
 // Modified by alfypops, 2026: `~` resolves HOME first, as Git does.
-use dirs;
 use serde_json::Value;
 use std::collections::HashMap;
 

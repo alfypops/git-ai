@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: shared test environment guard.
 use std::ffi::OsString;
 
 /// The variable `mdm::utils::home_dir()` reads first on this platform.
