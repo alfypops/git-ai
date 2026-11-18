@@ -1,9 +1,11 @@
 # Linux and Windows release builds for this fork, ported from upstream's release.yml
 # build matrix and test.yml unix-core row. Pull requests and manual runs build the
 # binaries and SHA256SUMS without publishing; pull requests also run the unix-core
-# tests. A pushed v1.7.5-cs.* tag also publishes the GitHub release. The macOS
-# binary is built, signed and added to that release locally by scripts/cs-release.sh.
-# Builds get no secrets and no telemetry keys.
+# tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also publishes
+# the GitHub release; the tag must be on cs/v1.7.5 (merge first). A manual run on
+# cs/v1.7.5 runs the same tag gates against v<Cargo.toml version> before the tag is
+# pushed. The macOS binary is built, signed and added to that release locally by
+# scripts/cs-release.sh. Builds get no secrets and no telemetry keys.
 name: CS Release
 
 permissions:
@@ -39,10 +41,12 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Check tag, branch and existing release
-        if: github.event_name == 'push'
+        if: >-
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/cs/v1.7.5')
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', steps.get-version.outputs.version) }}
           VERSION: ${{ steps.get-version.outputs.version }}
         run: |
           set -euo pipefail
@@ -224,13 +228,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Assembles and checks the release on every run; only a pushed tag creates it.
-  publish:
-    name: Assemble release (publish on tag)
+  assemble:
+    name: Assemble release
     needs: checksums
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -253,8 +254,26 @@ jobs:
             [[ -s "$file" ]] || { echo "::error::Expected a non-empty $file"; exit 1; }
           done
 
+  publish:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download binaries and SHA256SUMS
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+          path: release
+
       - name: Create release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -263,6 +282,20 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "alfypops build of git-ai $TAG" \
             --notes-file cs-release-notes.md
+
+  release-script:
+    name: Test cs-release.sh checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: bash scripts/tests/cs-release-test.sh
 
   unix-core:
     name: Test unix-core
