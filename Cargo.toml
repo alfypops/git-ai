@@ -1,4 +1,5 @@
 # Modified by alfypops, 2026: local-only notes push option
+# Modified by alfypops, 2026: gix-path dependency.
 [package]
 name = "git-ai"
 version = "1.7.5-cs.5"
@@ -34,6 +35,7 @@ crossterm = "0.29"
 keyring = { version = "3", features = ["sync-secret-service", "apple-native", "windows-native"], optional = true }
 once_cell = "1.21"
 gix-config = { version = "0.56.0", features = ["sha1"] }
+gix-path = "0.12"
 gix-index = { version = "0.51.0", features = ["sha1"] }
 rand = "0.10"
 regex = "1.12"

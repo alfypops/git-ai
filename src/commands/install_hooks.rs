@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: git-ai home follows the environment on Windows.
 use crate::config;
 use crate::daemon::DaemonConfig;
 use crate::error::GitAiError;
@@ -1026,10 +1027,13 @@ async fn async_run_uninstall(
 /// All telemetry now flows through the daemon control socket, so the per-PID
 /// log file system under `~/.git-ai/internal/logs/` is no longer needed.
 fn cleanup_legacy_envelope_logs() {
-    let Some(home) = dirs::home_dir() else {
+    let Some(internal) = crate::config::internal_dir_path() else {
         return;
     };
-    let internal = home.join(".git-ai").join("internal");
+    // The home fallback is `.`: never delete a cwd-relative directory.
+    if !internal.is_absolute() {
+        return;
+    }
 
     // Remove the entire logs directory
     let logs_dir = internal.join("logs");
@@ -1047,47 +1051,10 @@ fn cleanup_legacy_envelope_logs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EnvVarGuard;
     use serial_test::serial;
     use std::path::PathBuf;
     use tempfile::tempdir;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        old: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let old = std::env::var(key).ok();
-            // SAFETY: tests marked `serial` avoid concurrent env mutation.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, old }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let old = std::env::var(key).ok();
-            // SAFETY: tests marked `serial` avoid concurrent env mutation.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests marked `serial` avoid concurrent env mutation.
-            unsafe {
-                if let Some(old) = &self.old {
-                    std::env::set_var(self.key, old);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
 
     fn test_binary_path(install_dir: &Path) -> PathBuf {
         #[cfg(windows)]
@@ -1290,7 +1257,7 @@ mod tests {
         #[cfg(windows)]
         let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
         let _api_base = EnvVarGuard::set("API_BASE", "https://enterprise.example");
-        let _api_key = EnvVarGuard::remove("API_KEY");
+        let _api_key = EnvVarGuard::unset("API_KEY");
 
         let changed = persist_install_config(&test_binary_path(&install_dir), false).unwrap();
 
@@ -1325,7 +1292,7 @@ mod tests {
         #[cfg(windows)]
         let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
         let _api_base = EnvVarGuard::set("API_BASE", "https://enterprise.example");
-        let _api_key = EnvVarGuard::remove("API_KEY");
+        let _api_key = EnvVarGuard::unset("API_KEY");
 
         let existing_git_path = if cfg!(windows) {
             r"D:\PortableGit\bin\git.exe"
@@ -1359,8 +1326,8 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
         #[cfg(windows)]
         let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
-        let _api_base = EnvVarGuard::remove("API_BASE");
-        let _api_key = EnvVarGuard::remove("API_KEY");
+        let _api_base = EnvVarGuard::unset("API_BASE");
+        let _api_key = EnvVarGuard::unset("API_KEY");
 
         let changed = persist_install_config(&test_binary_path(&install_dir), false).unwrap();
         assert!(!changed);
@@ -1383,7 +1350,7 @@ mod tests {
         let _home = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
         #[cfg(windows)]
         let _userprofile = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
-        let _api_base = EnvVarGuard::remove("API_BASE");
+        let _api_base = EnvVarGuard::unset("API_BASE");
         let _api_key = EnvVarGuard::set("API_KEY", "sk-enterprise-key-12345");
 
         let changed = persist_install_config(&test_binary_path(&install_dir), false).unwrap();

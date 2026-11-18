@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: git-ai home follows the environment on Windows.
 // Critical regression tests for old-format/new-format coexistence during cutover scenarios
 //
 // These tests verify that git-ai correctly handles:
@@ -2657,9 +2658,8 @@ fn test_amend_preserves_sessions_under_http_notes_backend() {
     };
     let daemon_patch_json =
         serde_json::to_string(&daemon_patch).expect("serialize daemon config patch");
-    // `dirs::home_dir()` does not honor HOME/USERPROFILE overrides on Windows,
-    // so explicitly isolate the daemon's HTTP notes cache at a path this test
-    // can read on every platform.
+    // Explicitly isolate the daemon's HTTP notes cache at a path this test can
+    // read on every platform, independent of the harness home.
     let notes_db_dir = tempfile::tempdir().expect("create isolated notes-db directory");
     let notes_db_path = notes_db_dir.path().join("notes-db");
     let notes_db_path_string = notes_db_path.to_string_lossy().to_string();

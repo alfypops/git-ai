@@ -1,7 +1,7 @@
 # Linux and Windows release builds for this fork, ported from upstream's release.yml
 # build matrix and test.yml unix-core row. Pull requests and manual runs build the
 # binaries and SHA256SUMS without publishing; pull requests also run the unix-core
-# tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also publishes
+# tests, the Windows home-from-environment lib tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also publishes
 # the GitHub release; the tag must be on cs/v1.7.5 (merge first). A manual run on
 # cs/v1.7.5 runs the tag and branch checks against v<Cargo.toml version> before the tag
 # is pushed; there an existing release only warns. The macOS binary is built, signed and added to that release locally by
@@ -361,3 +361,42 @@ jobs:
           CARGO_INCREMENTAL: 0
           GIT_AI_TEST_SHARED_DAEMON_POOL_SIZE: 4
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
+
+  windows-home-env:
+    name: Test home from environment (Windows)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.93.0"
+
+      - name: Cache dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run home-from-environment tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib follows_home_env 2>&1 | tee test-output.txt
+          grep -q 'test result: ok. 5 passed' test-output.txt || {
+            echo "::error::Expected 'test result: ok. 5 passed'"
+            exit 1
+          }
+        env:
+          CARGO_INCREMENTAL: 0

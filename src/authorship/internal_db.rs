@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: git-ai home follows the environment on Windows.
 // DEPRECATED: The internal DB is deprecated and in the process of being removed.
 // It has been superseded by use-case-specific databases.
 
@@ -184,9 +185,9 @@ impl InternalDatabase {
             return Ok(PathBuf::from(test_path));
         }
 
-        let home = dirs::home_dir()
+        let internal = crate::config::internal_dir_path()
             .ok_or_else(|| GitAiError::Generic("Could not determine home directory".to_string()))?;
-        Ok(home.join(".git-ai").join("internal").join("db"))
+        Ok(internal.join("db"))
     }
 
     /// Initialize schema and handle migrations
@@ -1055,5 +1056,25 @@ mod tests {
         assert_eq!(calculate_next_retry(5, now), now + 12 * 60 * 60); // 12 hours
         assert_eq!(calculate_next_retry(6, now), now + 24 * 60 * 60); // 24 hours
         assert_eq!(calculate_next_retry(7, now), now + 24 * 60 * 60); // 24 hours (max)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(notes_db_env)]
+    fn database_path_follows_home_env() {
+        use crate::test_support::{EnvVarGuard, HOME_ENV};
+
+        let home = tempfile::tempdir().unwrap();
+        let _override = EnvVarGuard::unset("GIT_AI_TEST_DB_PATH");
+        let _legacy_override = EnvVarGuard::unset("GITAI_TEST_DB_PATH");
+        let _home = EnvVarGuard::set(HOME_ENV, home.path().to_str().unwrap());
+
+        let path = InternalDatabase::database_path().unwrap();
+        assert!(
+            path.starts_with(home.path()),
+            "{} should be under {}",
+            path.display(),
+            home.path().display()
+        );
     }
 }

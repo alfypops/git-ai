@@ -1,6 +1,7 @@
 // Modified by alfypops, 2026: configurable authorship notes namespace.
 // Modified by alfypops, 2026: local-only notes push option
 // Modified by alfypops, 2026: daemon_repo_roots config key.
+// Modified by alfypops, 2026: `~` resolves HOME first, as Git does.
 use dirs;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -57,7 +58,7 @@ fn detect_pattern_type(value: &str) -> PatternType {
 fn resolve_path_to_remotes(path: &str) -> Result<Vec<String>, String> {
     // Expand ~ to home directory
     let expanded_path = if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = gix_path::env::home_dir() {
             format!("{}{}", home.to_string_lossy(), &path[1..])
         } else {
             path.to_string()
