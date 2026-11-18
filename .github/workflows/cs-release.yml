@@ -1,6 +1,7 @@
 # Linux and Windows release builds for this fork, ported from upstream's release.yml
-# build matrix and test.yml unix-core row. Pull requests and manual runs build and
-# test only; a pushed v1.7.5-cs.* tag also publishes the GitHub release. The macOS
+# build matrix and test.yml unix-core row. Pull requests and manual runs build the
+# binaries and SHA256SUMS without publishing; pull requests also run the unix-core
+# tests. A pushed v1.7.5-cs.* tag also publishes the GitHub release. The macOS
 # binary is built, signed and added to that release locally by scripts/cs-release.sh.
 # Builds get no secrets and no telemetry keys.
 name: CS Release
@@ -26,16 +27,18 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Get version from Cargo.toml
         id: get-version
         run: |
           set -euo pipefail
+          [[ $(grep -c '^version = ' Cargo.toml) -eq 1 ]] || { echo "::error::Expected exactly one top-level version in Cargo.toml"; exit 1; }
           version=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
           [[ -n "$version" ]] || { echo "::error::No version in Cargo.toml"; exit 1; }
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Check tag and existing release
+      - name: Check tag, branch and existing release
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,8 +50,12 @@ jobs:
             echo "::error::Tag $TAG does not match Cargo.toml version v$VERSION"
             exit 1
           fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/cs/v1.7.5; then
+            echo "::error::Tag $TAG is not on cs/v1.7.5"
+            exit 1
+          fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "::error::Release $TAG already exists; refusing to overwrite its assets"
+            echo "::error::Release $TAG already exists; refusing to overwrite its assets. If an earlier run left it partial or failed, run gh release delete $TAG and re-run."
             exit 1
           fi
 
@@ -217,9 +224,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Assembles and checks the release on every run; only a pushed tag creates it.
   publish:
-    name: Publish release
-    if: github.event_name == 'push'
+    name: Assemble release (publish on tag)
     needs: checksums
     runs-on: ubuntu-latest
     permissions:
@@ -236,7 +243,18 @@ jobs:
           merge-multiple: true
           path: release
 
+      - name: Check release assets
+        run: |
+          set -euo pipefail
+          ls -l release
+          (cd release && sha256sum -c SHA256SUMS)
+          [[ $(find release -maxdepth 1 -name 'git-ai-*' | wc -l) -eq 4 ]] || { echo "::error::Expected 4 binaries"; exit 1; }
+          for file in release/SHA256SUMS LICENSE cs-release-notes.md; do
+            [[ -s "$file" ]] || { echo "::error::Expected a non-empty $file"; exit 1; }
+          done
+
       - name: Create release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
