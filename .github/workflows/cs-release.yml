@@ -1,0 +1,305 @@
+# Linux and Windows release builds for this fork, ported from upstream's release.yml
+# build matrix and test.yml unix-core row. Pull requests and manual runs build and
+# test only; a pushed v1.7.5-cs.* tag also publishes the GitHub release. The macOS
+# binary is built, signed and added to that release locally by scripts/cs-release.sh.
+# Builds get no secrets and no telemetry keys.
+name: CS Release
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [cs/v1.7.5]
+  workflow_dispatch:
+  push:
+    tags: ['v1.7.5-cs.*']
+
+jobs:
+  version:
+    name: Read version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Get version from Cargo.toml
+        id: get-version
+        run: |
+          set -euo pipefail
+          version=$(grep '^version = ' Cargo.toml | cut -d'"' -f2)
+          [[ -n "$version" ]] || { echo "::error::No version in Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag and existing release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.get-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$TAG" != "v$VERSION" ]]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version v$VERSION"
+            exit 1
+          fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; refusing to overwrite its assets"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            asset: git-ai-linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: git-ai-linux-arm64
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            asset: git-ai-windows-x86_64.exe
+            file_arch: x86-64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: git-ai-windows-arm64.exe
+            file_arch: Aarch64
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+      BINARY: target/${{ matrix.target }}/release/git-ai${{ contains(matrix.os, 'windows') && '.exe' || '' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build in Docker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/workspace \
+            -w /workspace \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e TARGET \
+            ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d \
+            bash -c '
+              set -euo pipefail
+              apt-get update
+              apt-get install -y curl build-essential pkg-config musl-tools
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0 --target "$TARGET"
+              . "$HOME/.cargo/env"
+              cargo build --release --target "$TARGET"
+              strip "target/$TARGET/release/git-ai"
+            '
+
+      - name: Install Rust toolchain (Windows)
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.93.0"
+          targets: ${{ matrix.target }}
+
+      - name: Cache dependencies (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo build --release --target "$TARGET"
+        env:
+          CARGO_INCREMENTAL: 0
+          # Windows ARM64 runners have no GNU strip; strip at link time instead.
+          RUSTFLAGS: ${{ matrix.os == 'windows-11-arm' && '-C strip=symbols' || '' }}
+
+      - name: Verify binary is statically linked (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          file "$BINARY"
+          if ldd "$BINARY" 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+            echo "Binary is statically linked (musl) - no GLIBC dependency"
+          else
+            echo "::error::Binary is dynamically linked - expected static musl binary"
+            ldd "$BINARY" || true
+            exit 1
+          fi
+
+      - name: Verify binary architecture (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          FILE_ARCH: ${{ matrix.file_arch }}
+        run: |
+          description=$(file "$BINARY")
+          echo "$description"
+          if [[ "$description" != *"$FILE_ARCH"* ]]; then
+            echo "::error::Expected a $FILE_ARCH binary"
+            exit 1
+          fi
+
+      - name: Strip binary (Windows x64)
+        if: matrix.os == 'windows-2025'
+        shell: bash
+        run: strip "$BINARY"
+
+      # git-ai runs its own commands only when invoked as git-ai[.exe], so run it
+      # under its build name before copying it to the asset name.
+      - name: Check --version
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          actual=$("$BINARY" --version)
+          echo "$actual"
+          if [[ "$actual" != "$VERSION" ]]; then
+            echo "::error::Expected version $VERSION, got $actual"
+            exit 1
+          fi
+
+      - name: Copy binary to release directory
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "$BINARY" "release/$ASSET"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.asset }}
+          path: release/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: git-ai-*
+          merge-multiple: true
+          path: release
+
+      - name: Write SHA256SUMS
+        working-directory: release
+        run: |
+          set -euo pipefail
+          sha256sum git-ai-* > SHA256SUMS
+          cat SHA256SUMS
+          [[ $(wc -l < SHA256SUMS) -eq 4 ]] || { echo "::error::Expected 4 binaries"; exit 1; }
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: SHA256SUMS
+          path: release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    if: github.event_name == 'push'
+    needs: checksums
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download binaries and SHA256SUMS
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+          path: release
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" release/git-ai-* release/SHA256SUMS LICENSE \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "alfypops build of git-ai $TAG" \
+            --notes-file cs-release-notes.md
+
+  unix-core:
+    name: Test unix-core
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.93.0"
+
+      - name: Cache dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install Graphite CLI
+        run: npm install -g @withgraphite/graphite-cli@stable
+
+      - name: Install Task
+        uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2
+
+      - name: Install mold linker
+        run: sudo apt-get install -y mold
+
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_targets=(--lib --bins)
+          while IFS= read -r path; do
+            test_targets+=(--test "$(basename "$path" .rs)")
+          done < <(find tests -maxdepth 1 -type f -name '*.rs' | sort)
+
+          task test CARGO_TEST_ARGS="${test_targets[*]}" TEST_THREADS=4
+          task test CARGO_TEST_ARGS="--doc" TEST_THREADS=4
+        env:
+          CARGO_INCREMENTAL: 0
+          GIT_AI_TEST_SHARED_DAEMON_POOL_SIZE: 4
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
