@@ -1,6 +1,7 @@
 <!-- Modified by alfypops, 2026: local-only notes push policy and isolated authorship namespace with sense examples -->
 <!-- Modified by alfypops, 2026: daemon_repo_roots allow-list -->
 <!-- Modified by alfypops, 2026: where to report fork bugs and vulnerabilities -->
+<!-- Modified by alfypops, 2026: Linux and Windows release builds in CI -->
 > **alfypops build of git-ai**, based on [upstream git-ai](https://github.com/git-ai-project/git-ai) v1.7.5.
 > Set `git-ai config set notes_push never` to keep captured authorship notes local.
 > Opt destinations back in with `git-ai config --add notes_push_repositories 'https://github.com/my-org/*'`.
@@ -14,7 +15,7 @@
 > To scope the daemon to managed clones, run `git-ai config --add daemon_repo_roots /abs/path/to/clone`. With a non-empty list, the daemon ignores git trace events and checkpoints from any repository whose git common dir is not under a listed path (linked worktrees of a listed clone are included; list the main clone, since a linked worktree's own path does not match). Ignored work leaves nothing: no notes, working logs, pushes or error lines. An empty or absent list tracks every repository, as upstream does; an invalid value (not an array, `null`, or a relative entry) fails closed for every repository it doesn't validly list. The daemon picks up list changes when the config file changes, without a restart. CodeSense's managed hooks only target managed repositories; the daemon enforces the list anyway.
 > Fork-only: `git-ai upgrade` and background upstream updates are disabled; CodeSense updates this build.
 > Not affiliated with or supported by upstream. Report bugs in this build as issues in this repository, and vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Problems that also occur in upstream git-ai belong upstream. The full upstream history lives at [git-ai-project/git-ai](https://github.com/git-ai-project/git-ai).
-> This build remains Apache-2.0; see [LICENSE](LICENSE). Release preparation: `scripts/cs-release.sh` (dry run by default, upload requires `--publish`).
+> This build remains Apache-2.0; see [LICENSE](LICENSE). Release preparation: CI (`.github/workflows/cs-release.yml`) builds the Linux and Windows binaries and creates the release from a pushed `v<version>` tag; `scripts/cs-release.sh` then adds the signed macOS binary to that release (dry run by default, upload requires `--publish`).
 
 # git-ai   <a href="https://discord.gg/XJStYvkb5U"><img alt="Discord" src="https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white" /></a>        
 
