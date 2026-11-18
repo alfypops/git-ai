@@ -110,10 +110,10 @@ rm -rf "$FAKE_RELEASE"
 expect refuse 'missing release is refused, naming it' "Release v$version on $repo could not be read" check_release
 
 new_release
-publish_macos six > /dev/null
+expect pass 'verify_upload setup: publish macOS' '' publish_macos six
 echo tampered > "$FAKE_RELEASE/git-ai-macos-arm64"
 expect refuse 'verify_upload: changed macOS binary is refused' 'uploaded macOS binary or SHA256SUMS' verify_upload
-publish_macos seven > /dev/null 2>&1
+expect pass 'verify_upload setup: re-publish over the changed binary' '' publish_macos seven
 echo extra >> "$FAKE_RELEASE/SHA256SUMS"
 expect refuse 'verify_upload: changed SHA256SUMS is refused' 'uploaded macOS binary or SHA256SUMS' verify_upload
 

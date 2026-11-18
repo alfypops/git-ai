@@ -53,6 +53,8 @@ Release v$version has no SHA256SUMS (an earlier upload removed it). Restore CI's
   gh release upload v$version SHA256SUMS --repo $repo
 The tag run keeps its artifacts for 7 days; after that, run gh release delete v$version and re-run the tag run.
 GitHub re-runs a run only within 30 days of the tag run; after that, cut a new version.
+A re-run publishes new Linux and Windows sha256s (the builds are not byte-reproducible),
+so once anything pins this release's checksums, cut a new version instead of re-running.
 EOF
     exit 1
   fi

@@ -3,8 +3,8 @@
 # binaries and SHA256SUMS without publishing; pull requests also run the unix-core
 # tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also publishes
 # the GitHub release; the tag must be on cs/v1.7.5 (merge first). A manual run on
-# cs/v1.7.5 runs the same tag gates against v<Cargo.toml version> before the tag is
-# pushed. The macOS binary is built, signed and added to that release locally by
+# cs/v1.7.5 runs the tag and branch checks against v<Cargo.toml version> before the tag
+# is pushed; there an existing release only warns. The macOS binary is built, signed and added to that release locally by
 # scripts/cs-release.sh. Builds get no secrets and no telemetry keys.
 name: CS Release
 
