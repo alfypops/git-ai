@@ -13,7 +13,8 @@ cat > "$tmp/bin/gh" << 'SHIM'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1 $2" in
-  'auth status' | 'release view') exit 0 ;;
+  'auth status') exit 0 ;;
+  'release view') [[ -d $FAKE_RELEASE ]] ;;
   'release download')
     shift 3
     patterns=() dir=.
@@ -104,6 +105,52 @@ new_release
 echo tampered > "$FAKE_RELEASE/git-ai-linux-arm64"
 expect refuse 'tampered CI binary is refused' "CI's binaries on v$version do not match" publish_macos five
 
+expect pass 'existing release passes check_release' '' check_release
+rm -rf "$FAKE_RELEASE"
+expect refuse 'missing release is refused, naming it' "Release v$version on $repo could not be read" check_release
+
+new_release
+publish_macos six > /dev/null
+echo tampered > "$FAKE_RELEASE/git-ai-macos-arm64"
+expect refuse 'verify_upload: changed macOS binary is refused' 'uploaded macOS binary or SHA256SUMS' verify_upload
+publish_macos seven > /dev/null 2>&1
+echo extra >> "$FAKE_RELEASE/SHA256SUMS"
+expect refuse 'verify_upload: changed SHA256SUMS is refused' 'uploaded macOS binary or SHA256SUMS' verify_upload
+
+new_release
+grep -v ' git-ai-linux-arm64$' "$FAKE_RELEASE/SHA256SUMS" > "$tmp/sums" && mv "$tmp/sums" "$FAKE_RELEASE/SHA256SUMS"
+expect refuse 'SHA256SUMS with 3 non-macOS lines is refused' "CI's binaries on v$version do not match" publish_macos eight
+
+new_release
+echo 'ci extra' > "$FAKE_RELEASE/git-ai-extra"
+(cd "$FAKE_RELEASE" && shasum -a 256 git-ai-extra >> SHA256SUMS)
+expect refuse 'SHA256SUMS with 5 non-macOS lines is refused' "CI's binaries on v$version do not match" publish_macos nine
+
+# A macOS line that does not match its asset, or whose asset is missing, is a partial publish.
+new_release
+echo 'macos old' > "$FAKE_RELEASE/git-ai-macos-arm64"
+(cd "$FAKE_RELEASE" && shasum -a 256 git-ai-macos-arm64 >> SHA256SUMS)
+echo 'macos changed' > "$FAKE_RELEASE/git-ai-macos-arm64"
+expect pass 'macOS line not matching its asset: a re-run replaces both' '' publish_macos ten
+new_release
+(cd "$FAKE_RELEASE" && echo 'macos gone' > git-ai-macos-arm64 && shasum -a 256 git-ai-macos-arm64 >> SHA256SUMS && rm git-ai-macos-arm64)
+expect pass 'macOS line with no asset: a re-run replaces it' '' publish_macos eleven
+
+# The dry run prints the steps in order: verify CI's binaries before the build, upload after the sums.
+step_line() { printf '%s\n' "$dry_run" | grep -n -m1 -F -- "$1" | cut -d: -f1; }
+dry_run=$(bash "$script" --dry-run)
+verify_line=$(step_line "shasum -a 256 -c CI's four")
+build_line=$(step_line 'cargo build --release')
+sums_line=$(step_line '(expect 5 lines)')
+upload_line=$(step_line 'gh release upload')
+if [[ -n $verify_line && -n $build_line && -n $sums_line && -n $upload_line ]] &&
+  ((verify_line < build_line && sums_line < upload_line)); then
+  echo 'ok   - dry run orders verification, build, sums and upload'
+else
+  echo "FAIL - dry run step order (verify $verify_line, build $build_line, sums $sums_line, upload $upload_line)"
+  failures=$((failures + 1))
+fi
+
 # check_tag against a local stand-in for the fork.
 git init -q --bare "$tmp/fork.git"
 git init -q "$tmp/clone"
@@ -123,6 +170,9 @@ git add tracked
 expect refuse 'staged change is refused' 'uncommitted or untracked' check_tag
 git -c user.name=test -c user.email=test@example.com commit -q -m later
 expect refuse 'HEAD past the tag is refused' "HEAD is not the commit tagged v$version" check_tag
+
+remote_url="$tmp/missing.git"
+expect refuse 'unreadable remote is refused' "Could not read tags from $repo" check_tag
 
 ((failures == 0)) || { echo "$failures failed"; exit 1; }
 echo 'all passed'

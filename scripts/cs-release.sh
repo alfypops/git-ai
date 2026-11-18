@@ -43,7 +43,8 @@ download_release_assets() {
 }
 
 # The release's SHA256SUMS lists CI's four binaries, plus macOS once it is published.
-# A macOS asset without its SHA256SUMS line is a partial publish, which a re-run replaces.
+# A macOS asset without its SHA256SUMS line is a partial publish, which a re-run replaces;
+# so is a macOS line whose asset is missing or does not match it (CI's four lines still must).
 verify_ci_binaries() {
   if [[ ! -f "$assets/SHA256SUMS" ]]; then
     cat >&2 << EOF
@@ -51,6 +52,7 @@ Release v$version has no SHA256SUMS (an earlier upload removed it). Restore CI's
   gh run download <tag run id> --repo $repo -n SHA256SUMS
   gh release upload v$version SHA256SUMS --repo $repo
 The tag run keeps its artifacts for 7 days; after that, run gh release delete v$version and re-run the tag run.
+GitHub re-runs a run only within 30 days of it; after that, cut a new version.
 EOF
     exit 1
   fi

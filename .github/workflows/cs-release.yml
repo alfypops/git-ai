@@ -50,6 +50,10 @@ jobs:
           VERSION: ${{ steps.get-version.outputs.version }}
         run: |
           set -euo pipefail
+          if [[ $TAG != v1.7.5-cs.* ]]; then
+            echo "::error::Tag $TAG does not match the trigger pattern v1.7.5-cs.*"
+            exit 1
+          fi
           if [[ "$TAG" != "v$VERSION" ]]; then
             echo "::error::Tag $TAG does not match Cargo.toml version v$VERSION"
             exit 1
@@ -59,8 +63,11 @@ jobs:
             exit 1
           fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            echo "::error::Release $TAG already exists; refusing to overwrite its assets. If an earlier run left it partial or failed, run gh release delete $TAG and re-run."
-            exit 1
+            if [[ $GITHUB_EVENT_NAME == push ]]; then
+              echo "::error::Release $TAG already exists; refusing to overwrite its assets. If an earlier run left it partial or failed, run gh release delete $TAG and re-run."
+              exit 1
+            fi
+            echo "::warning::Release $TAG already exists; bump Cargo.toml before the next tag"
           fi
 
   build:
@@ -286,7 +293,7 @@ jobs:
   release-script:
     name: Test cs-release.sh checks
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - name: Checkout code
