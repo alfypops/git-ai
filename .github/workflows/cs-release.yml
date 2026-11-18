@@ -73,7 +73,7 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             asset: git-ai-windows-arm64.exe
-            file_arch: Aarch64
+            file_arch: ARM64
     env:
       TARGET: ${{ matrix.target }}
       ASSET: ${{ matrix.asset }}
