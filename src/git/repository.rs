@@ -1,4 +1,5 @@
 // Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: `~` resolves HOME first, as Git does.
 use crate::config;
 use crate::error::GitAiError;
 use crate::git::repo_state::{
@@ -2277,7 +2278,7 @@ pub(crate) fn git_config_file_for_repo_paths(
     let mut config =
         gix_config::File::from_globals().map_err(|e| GitAiError::GixError(e.to_string()))?;
 
-    let home = dirs::home_dir();
+    let home = gix_path::env::home_dir();
     let options = gix_config::file::init::Options {
         includes: gix_config::file::includes::Options::follow(
             gix_config::path::interpolate::Context {
@@ -3631,5 +3632,34 @@ mod tests {
         assert!(rewritten.iter().any(|arg| arg == "--no-textconv"));
         assert!(rewritten.iter().any(|arg| arg == "--no-color"));
         assert!(rewritten.iter().any(|arg| arg == "--no-relative"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(notes_db_env)]
+    fn include_tilde_follows_home_env() {
+        use crate::test_support::EnvVarGuard;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("inc.gitconfig"),
+            "[probe]\n\tvalue = from-home\n",
+        )
+        .unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git_dir = repo.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            git_dir.join("config"),
+            "[include]\n\tpath = ~/inc.gitconfig\n",
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", home.path().to_str().unwrap());
+
+        let config = git_config_file_for_repo_paths(&git_dir, &git_dir).unwrap();
+        assert_eq!(
+            config.string("probe.value").map(|value| value.to_string()),
+            Some("from-home".to_string())
+        );
     }
 }

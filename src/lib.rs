@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: shared test environment guard.
 pub mod api;
 pub mod auth;
 pub mod authorship;
@@ -21,6 +22,8 @@ pub mod repo_url;
 pub(crate) mod sandbox;
 pub mod sqlite;
 pub mod streams;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod token_usage;
 pub mod tokio_runtime;
 pub mod utils;

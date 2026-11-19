@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "git-ai"
-version = "1.7.5-cs.5"
+version = "1.7.5-cs.6"
 dependencies = [
  "chrono",
  "clap",
@@ -1080,6 +1080,7 @@ dependencies = [
  "git-ai",
  "gix-config",
  "gix-index",
+ "gix-path",
  "glob",
  "ignore",
  "imara-diff",

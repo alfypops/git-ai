@@ -1,6 +1,7 @@
 // Modified by alfypops, 2026: configured authorship ref in daemon test fixture.
 // Modified by alfypops, 2026: local-only notes push option
 // Modified by alfypops, 2026: ignore trace roots outside daemon_repo_roots.
+// Modified by alfypops, 2026: shared test environment guard.
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
 use crate::checkpoint_content_budget::CheckpointContentBudget;
 use crate::config;
@@ -11827,8 +11828,8 @@ mod tests {
     }
 
     use super::*;
+    use crate::test_support::EnvVarGuard;
     use serial_test::serial;
-    use std::ffi::OsString;
     use std::io::Write;
 
     #[test]
@@ -11853,54 +11854,6 @@ mod tests {
             "worktree": "/repo/nested",
         });
         assert_eq!(trace_payload_worktree_hint(&secondary), None);
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var_os(key);
-            // SAFETY: these tests are serialized via #[serial], so mutating the
-            // process environment is isolated for the duration of each test.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var_os(key);
-            // SAFETY: these tests are serialized via #[serial], so mutating the
-            // process environment is isolated for the duration of each test.
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => {
-                    // SAFETY: these tests are serialized via #[serial], so restoring
-                    // process environment state is isolated for the duration of each test.
-                    unsafe {
-                        std::env::set_var(self.key, value);
-                    }
-                }
-                None => {
-                    // SAFETY: these tests are serialized via #[serial], so restoring
-                    // process environment state is isolated for the duration of each test.
-                    unsafe {
-                        std::env::remove_var(self.key);
-                    }
-                }
-            }
-        }
     }
 
     fn sample_checkpoint_request() -> ControlRequest {

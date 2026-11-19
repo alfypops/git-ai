@@ -1,4 +1,5 @@
 // Modified by alfypops, 2026: local-only notes push option
+// Modified by alfypops, 2026: git-ai home follows the environment on Windows.
 use crate::api::client::ApiContext;
 use crate::config::{self, UpdateChannel};
 use crate::observability::log_message;
@@ -514,9 +515,8 @@ fn run_install_script(script_content: &str, tag: &str, silent: bool) -> Result<(
         // binary and shims are in use and need to be replaced. The installer will wait
         // for the files to be released before proceeding.
         let pid = std::process::id();
-        let log_dir = dirs::home_dir()
+        let log_dir = crate::config::git_ai_dir_path()
             .ok_or_else(|| "Could not determine home directory".to_string())?
-            .join(".git-ai")
             .join("upgrade-logs");
 
         // Ensure the log directory exists

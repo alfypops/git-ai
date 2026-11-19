@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: git-ai home follows the environment on Windows.
 //! Dedicated notes-backend storage at `~/.git-ai/internal/notes-db`.
 //!
 //! Single `notes` table that doubles as cache and sync queue:
@@ -129,9 +130,9 @@ impl NotesDatabase {
             return Ok(PathBuf::from(test_path));
         }
 
-        let home = dirs::home_dir()
+        let internal = crate::config::internal_dir_path()
             .ok_or_else(|| GitAiError::Generic("Could not determine home directory".to_string()))?;
-        Ok(home.join(".git-ai").join("internal").join("notes-db"))
+        Ok(internal.join("notes-db"))
     }
 
     /// Apply schema migrations until the DB is at `SCHEMA_VERSION`.
@@ -947,8 +948,8 @@ mod tests {
     #[serial_test::serial(notes_db_env)]
     fn test_database_path_contains_expected_segments() {
         // Without the test env var set we expect the path to include .git-ai/internal/notes-db
-        // (this test verifies the non-override branch at the schema level; in CI the HOME is
-        // always set so dirs::home_dir() returns Some).
+        // (this test verifies the non-override branch at the schema level; the base comes
+        // from internal_dir_path(), which always returns Some).
         unsafe {
             std::env::remove_var("GIT_AI_TEST_NOTES_DB_PATH");
         }
@@ -968,6 +969,25 @@ mod tests {
             path_str.ends_with("notes-db"),
             "path should end with notes-db: {}",
             path_str
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[serial_test::serial(notes_db_env)]
+    fn database_path_follows_home_env() {
+        use crate::test_support::{EnvVarGuard, HOME_ENV};
+
+        let home = tempfile::tempdir().unwrap();
+        let _override = EnvVarGuard::unset("GIT_AI_TEST_NOTES_DB_PATH");
+        let _home = EnvVarGuard::set(HOME_ENV, home.path().to_str().unwrap());
+
+        let path = NotesDatabase::database_path().unwrap();
+        assert!(
+            path.starts_with(home.path()),
+            "{} should be under {}",
+            path.display(),
+            home.path().display()
         );
     }
 }

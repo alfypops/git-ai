@@ -1,3 +1,4 @@
+// Modified by alfypops, 2026: git-ai home follows the environment on Windows.
 #[cfg(all(not(test), feature = "keyring"))]
 use crate::auth::credential_backend::KeyringBackend;
 use crate::auth::credential_backend::{CredentialBackend, FileBackend};
@@ -81,10 +82,8 @@ impl CredentialStore {
 
     #[cfg(not(test))]
     fn default_production_path() -> PathBuf {
-        dirs::home_dir()
+        crate::config::internal_dir_path()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".git-ai")
-            .join("internal")
             .join("credentials")
     }
 
