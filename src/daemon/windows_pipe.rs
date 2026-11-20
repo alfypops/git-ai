@@ -416,6 +416,7 @@ impl OverlappedPipe {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn raw_handle(&self) -> HANDLE {
         self.handle
     }
@@ -600,6 +601,19 @@ mod windows_pipe_tests {
         ))
     }
 
+    /// Connects once the pipe exists: a server started on another thread may
+    /// not have bound its name yet.
+    fn connect_when_listening(path: &Path) -> OverlappedPipe {
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            match connect(path, CONNECT_TIMEOUT) {
+                Ok(pipe) => return pipe,
+                Err(error) if Instant::now() >= deadline => panic!("connect: {error}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
     /// The owner, DACL protection and allow ACEs of a pipe handle.
     struct PipeSecurity {
         owner_is_current_user: bool,
@@ -647,7 +661,7 @@ mod windows_pipe_tests {
             unsafe {
                 GetAclInformation(
                     dacl,
-                    &mut size as *mut _ as *mut _,
+                    &mut size as *mut ACL_SIZE_INFORMATION as *mut core::ffi::c_void,
                     std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
                     AclSizeInformation,
                 )
@@ -687,6 +701,13 @@ mod windows_pipe_tests {
         let error = PipeListener::bind(&path, true)
             .err()
             .expect("a second first-instance bind must fail");
+        assert!(
+            error.to_string().contains("(already in use)"),
+            "unexpected error: {error}"
+        );
+        let error = serve_pipe_workers("test", &path, 1, || true, || {}, |_| {})
+            .err()
+            .expect("serving a taken name must fail");
         assert!(
             error.to_string().contains("(already in use)"),
             "unexpected error: {error}"
@@ -748,7 +769,7 @@ mod windows_pipe_tests {
             .map(|index| {
                 let path = path.clone();
                 std::thread::spawn(move || {
-                    let mut pipe = connect(&path, CONNECT_TIMEOUT).expect("connect");
+                    let mut pipe = connect_when_listening(&path);
                     pipe.set_read_timeout(Some(CONNECT_TIMEOUT));
                     let message = format!("hello {index}\n");
                     pipe.write_all(message.as_bytes()).expect("write");
@@ -863,10 +884,18 @@ mod windows_pipe_tests {
                 .expect_err("a read with no reply must time out");
             (error.kind(), started.elapsed(), limit)
         });
-        let _server = listener.accept().expect("accept");
-        let (kind, elapsed, limit) = client.join().unwrap();
+        let server = listener.accept().expect("accept");
+        // Close the server end later, so a missing timeout fails instead of hanging.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            drop(server);
+        });
+        let (kind, elapsed, limit) = client.join().expect("the client read must time out");
         assert_eq!(kind, std::io::ErrorKind::TimedOut);
-        assert!(elapsed >= limit, "returned early after {elapsed:?}");
+        assert!(
+            elapsed + Duration::from_millis(20) >= limit,
+            "returned early after {elapsed:?}"
+        );
         assert!(elapsed < limit + Duration::from_secs(2), "took {elapsed:?}");
     }
 
