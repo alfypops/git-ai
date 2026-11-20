@@ -705,7 +705,22 @@ mod windows_pipe_tests {
             error.to_string().contains("(already in use)"),
             "unexpected error: {error}"
         );
-        let error = serve_pipe_workers("test", &path, 1, || true, || {}, |_| {})
+        // On its own thread, so a missing first-instance flag fails instead of hanging.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let serve_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(serve_pipe_workers(
+                "test",
+                &serve_path,
+                1,
+                || true,
+                || {},
+                |_| {},
+            ));
+        });
+        let error = receiver
+            .recv_timeout(CONNECT_TIMEOUT)
+            .expect("serve_pipe_workers must return")
             .err()
             .expect("serving a taken name must fail");
         assert!(
