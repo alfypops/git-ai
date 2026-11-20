@@ -12,7 +12,7 @@ trap 'rm -rf "$tmp"' EXIT
 # exists. $FAKE_RELEASE.ids lists the releases for its tag, one "id draft=... author created"
 # line each (default one, id 41). Every call is appended to $FAKE_LOG. FAKE_AFTER_UPLOAD and
 # FAKE_AFTER_EDIT are shell snippets run after an upload or a publish; FAKE_EDIT_NOOP=1 makes
-# the publish leave a draft.
+# the publish leave a draft and FAKE_PATCH_FAIL=1 makes it fail.
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/gh" << 'SHIM'
 #!/usr/bin/env bash
@@ -25,6 +25,7 @@ case "$1 $2" in
     if [[ -f $FAKE_RELEASE.ids ]]; then cat "$FAKE_RELEASE.ids"; else echo '41 draft=true ci 2026-11-20T00:00:00Z'; fi
     ;;
   'api -X')
+    [[ ${FAKE_PATCH_FAIL:-} != 1 ]] || { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }
     [[ $* == 'api -X PATCH repos/'*'/releases/41 -F draft=false --jq .draft' ]] || { echo "gh shim: unexpected $*" >&2; exit 1; }
     [[ ${FAKE_EDIT_NOOP:-} == 1 ]] || touch "$FAKE_RELEASE.published"
     bash -c "${FAKE_AFTER_EDIT:-}"
@@ -149,6 +150,10 @@ expect pass 'draft with a partial upload (macOS asset, 4-line SHA256SUMS): a re-
 published_and_consistent || fail 'partial re-run left a published, consistent release'
 
 new_release
+FAKE_PATCH_FAIL=1 expect refuse 'a failed publish is refused, naming the release' 'Publishing release 41 (v1.0.0-test) failed' publish_macos nineteen
+if published; then fail 'failed publish left a published release'; fi
+
+new_release
 FAKE_EDIT_NOOP=1 expect refuse 'publish that leaves a draft is refused' 'still a draft' publish_macos five
 expect pass 'after a publish that left a draft, a re-run replaces macOS and publishes' '' publish_macos six
 if ! { grep -q 'macos six' "$FAKE_RELEASE/git-ai-macos-arm64" && published_and_consistent; }; then
@@ -167,8 +172,9 @@ new_release
 two_releases
 expect refuse 'two releases for the tag are refused, listing them with the way out' \
   "gh api -X DELETE repos/$repo/releases/<id>" publish_macos nine
-touch "$FAKE_RELEASE.published"
-expect refuse 'a published release and a draft for the tag are refused' "Found 2 releases for v$version" publish_macos ten
+printf '%s\n' '41 draft=false ci 2026-11-20T00:00:00Z' '42 draft=true ci 2026-11-20T01:00:00Z' > "$FAKE_RELEASE.ids"
+expect refuse 'a published release and a draft for the tag: refused, never deleting the published one' \
+  'Never delete a published release: delete only the extra drafts' publish_macos ten
 rm -rf "$FAKE_RELEASE" "$FAKE_RELEASE.ids"
 expect refuse 'missing release is refused, naming it' "Release v$version on $repo does not exist" publish_macos eleven
 

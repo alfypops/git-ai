@@ -66,7 +66,12 @@ the_release() {
     0) echo "Release v$version on $repo does not exist; push the tag v$version and let CI create the draft first" >&2; return 1 ;;
     1) awk '{print $1}' <<< "$ids" ;;
     *)
-      printf 'Found %s releases for v%s on %s; delete all but CI'"'"'s draft, then re-run:\n%s\n' "$count" "$version" "$repo" "$ids" >&2
+      printf 'Found %s releases for v%s on %s:\n%s\n' "$count" "$version" "$repo" "$ids" >&2
+      if grep -q ' draft=false ' <<< "$ids"; then
+        echo 'Never delete a published release: delete only the extra drafts, then re-run (a complete published release then ends with nothing to do; an incomplete one needs a new version).' >&2
+      else
+        echo "Delete all but CI's draft, then re-run." >&2
+      fi
       delete_hint >&2
       return 1
       ;;
