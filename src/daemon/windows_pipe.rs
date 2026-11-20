@@ -26,10 +26,10 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, EqualSid, GetAce, GetAclInformation,
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    SYSTEM_MANDATORY_LABEL_ACE, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, INHERIT_ONLY_ACE,
+    LABEL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SYSTEM_MANDATORY_LABEL_ACE, TOKEN_INFORMATION_CLASS,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
@@ -184,10 +184,13 @@ fn acl_aces(acl: *const ACL) -> io::Result<Vec<*const ACE_HEADER>> {
 }
 
 /// The integrity level a SACL's mandatory label gives its object; an
-/// unlabelled object is medium.
+/// unlabelled object is medium. Inherit-only labels do not apply to it.
 fn label_integrity_rid(sacl: *const ACL) -> io::Result<u32> {
     for ace in acl_aces(sacl)? {
-        if unsafe { (*ace).AceType } == MANDATORY_LABEL_ACE_TYPE {
+        let header = unsafe { *ace };
+        if header.AceType == MANDATORY_LABEL_ACE_TYPE
+            && u32::from(header.AceFlags) & INHERIT_ONLY_ACE == 0
+        {
             let ace = ace as *const SYSTEM_MANDATORY_LABEL_ACE;
             return Ok(integrity_rid(
                 unsafe { &(*ace).SidStart } as *const u32 as PSID
