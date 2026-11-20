@@ -32,10 +32,17 @@ check_tag() {
     { echo 'The working tree has uncommitted or untracked files' >&2; exit 1; }
 }
 
-# The ids of every release for v$version, drafts included, one per line. GitHub allows
-# several drafts for one tag, and gh's tag lookup then returns whichever it finds first.
+# Every release for v$version, drafts included, one per line: id, draft, author, created.
+# GitHub allows several drafts for one tag, and gh's tag lookup then returns whichever it
+# finds first, so the script works by id once it has found the one release.
 release_ids() {
-  gh api --paginate "repos/$repo/releases" --jq ".[] | select(.tag_name == \"v$version\") | .id"
+  gh api --paginate "repos/$repo/releases" \
+    --jq ".[] | select(.tag_name == \"v$version\") | \"\\(.id) draft=\\(.draft) \\(.author.login) \\(.created_at)\""
+}
+
+# How to delete one release whatever its tag lookup would pick.
+delete_hint() {
+  printf 'Delete a release by its id: gh api -X DELETE repos/%s/releases/<id>\n' "$repo"
 }
 
 # CI's tag run creates the draft only when no release exists for the tag.
@@ -43,7 +50,9 @@ check_no_release() {
   local ids
   ids=$(release_ids) || { echo "Could not list the releases on $repo" >&2; exit 1; }
   [[ -z $ids ]] || {
-    echo "A release for v$version already exists on $repo. If it is a draft an earlier run left, run gh release delete v$version --repo $repo and re-run; a published release is immutable, so bump Cargo.toml and push a new tag." >&2
+    printf 'A release for v%s already exists on %s:\n%s\n' "$version" "$repo" "$ids" >&2
+    echo 'If it is a draft an earlier run left, delete it and re-run; a published release is immutable, so bump Cargo.toml and push a new tag.' >&2
+    delete_hint >&2
     exit 1
   }
 }
@@ -55,8 +64,12 @@ the_release() {
   count=$(grep -c . <<< "$ids") || true
   case $count in
     0) echo "Release v$version on $repo does not exist; push the tag v$version and let CI create the draft first" >&2; return 1 ;;
-    1) printf '%s\n' "$ids" ;;
-    *) echo "Found $count releases for v$version on $repo; delete all but CI's draft (gh release list --repo $repo), then re-run" >&2; return 1 ;;
+    1) awk '{print $1}' <<< "$ids" ;;
+    *)
+      printf 'Found %s releases for v%s on %s; delete all but CI'"'"'s draft, then re-run:\n%s\n' "$count" "$version" "$repo" "$ids" >&2
+      delete_hint >&2
+      return 1
+      ;;
   esac
 }
 
@@ -115,14 +128,19 @@ verify_ci_binaries() {
 Draft v$version has no SHA256SUMS (an earlier upload removed it). Restore CI's copy, then re-run:
   gh run download <tag run id> --repo $repo -n SHA256SUMS
   gh release upload v$version SHA256SUMS --repo $repo
-The tag run keeps its artifacts for 7 days; after that, run gh release delete v$version and re-run the tag run.
+The tag run keeps its artifacts for 7 days; after that, delete the draft
+(gh api -X DELETE repos/$repo/releases/$release_id) and re-run the tag run.
 GitHub re-runs a run only within 30 days of the tag run; after that, cut a new version.
 EOF
     exit 1
   fi
   (cd "$assets" && grep -v ' git-ai-macos-arm64$' SHA256SUMS > ci-SHA256SUMS &&
     [[ $(wc -l < ci-SHA256SUMS) -eq 4 ]] && shasum -a 256 -c ci-SHA256SUMS) ||
-    { echo "CI's binaries on v$version do not match its SHA256SUMS" >&2; exit 1; }
+    {
+      echo "CI's binaries on v$version do not match its SHA256SUMS. Do not regenerate SHA256SUMS: it would vouch for whatever is on the draft." >&2
+      echo "Delete the draft (gh api -X DELETE repos/$repo/releases/$release_id) and re-run the tag run, or cut a new version." >&2
+      exit 1
+    }
 }
 
 write_sums() {
@@ -143,11 +161,14 @@ verify_draft() {
     { echo "The assets on draft v$version do not match what this run checked and uploaded; nothing was published" >&2; exit 1; }
 }
 
+# Publishes the pinned release by id, never by a tag lookup.
 publish_release() {
+  local draft
   same_release
-  gh release edit "v$version" --repo "$repo" --draft=false > /dev/null
-  [[ $(gh release view "v$version" --repo "$repo" --json isDraft --jq .isDraft) == false ]] ||
-    { echo "Release v$version is still a draft after gh release edit --draft=false" >&2; exit 1; }
+  draft=$(gh api -X PATCH "repos/$repo/releases/$release_id" -F draft=false --jq .draft) ||
+    { echo "Publishing release $release_id (v$version) failed (see gh's error above); re-run to retry" >&2; exit 1; }
+  [[ $draft == false ]] ||
+    { echo "Release $release_id (v$version) is still a draft after publishing; re-run to retry" >&2; exit 1; }
 }
 
 verify_published() {
@@ -176,7 +197,7 @@ add_macos_and_publish() {
   step "gh release upload v$version target/cs-release/git-ai-macos-arm64 target/cs-release/SHA256SUMS --repo $repo --clobber" \
     upload_macos
   step "gh release view/download v$version: verify the draft $checks" verify_draft
-  step "gh release edit v$version --repo $repo --draft=false (publish; refuse unless it is no longer a draft)" publish_release
+  step "gh api -X PATCH repos/$repo/releases/<id> -F draft=false (publish the pinned release; refuse unless it is no longer a draft)" publish_release
   step "gh release view/download v$version: verify the published release $checks" verify_published
 }
 

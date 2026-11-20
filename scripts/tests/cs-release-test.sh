@@ -9,9 +9,10 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 # gh shim: the release is the directory $FAKE_RELEASE, a draft until $FAKE_RELEASE.published
-# exists. $FAKE_RELEASE.ids lists the ids of the releases for its tag (default one, 41).
-# Every call is appended to $FAKE_LOG. FAKE_AFTER_UPLOAD and FAKE_AFTER_EDIT are shell
-# snippets run after an upload or a publish; FAKE_EDIT_NOOP=1 makes release edit do nothing.
+# exists. $FAKE_RELEASE.ids lists the releases for its tag, one "id draft=... author created"
+# line each (default one, id 41). Every call is appended to $FAKE_LOG. FAKE_AFTER_UPLOAD and
+# FAKE_AFTER_EDIT are shell snippets run after an upload or a publish; FAKE_EDIT_NOOP=1 makes
+# the publish leave a draft.
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/gh" << 'SHIM'
 #!/usr/bin/env bash
@@ -21,7 +22,13 @@ case "$1 $2" in
   'auth status') exit 0 ;;
   'api --paginate')
     [[ -d $FAKE_RELEASE ]] || exit 0
-    if [[ -f $FAKE_RELEASE.ids ]]; then cat "$FAKE_RELEASE.ids"; else echo 41; fi
+    if [[ -f $FAKE_RELEASE.ids ]]; then cat "$FAKE_RELEASE.ids"; else echo '41 draft=true ci 2026-11-20T00:00:00Z'; fi
+    ;;
+  'api -X')
+    [[ $* == 'api -X PATCH repos/'*'/releases/41 -F draft=false --jq .draft' ]] || { echo "gh shim: unexpected $*" >&2; exit 1; }
+    [[ ${FAKE_EDIT_NOOP:-} == 1 ]] || touch "$FAKE_RELEASE.published"
+    bash -c "${FAKE_AFTER_EDIT:-}"
+    if [[ -f $FAKE_RELEASE.published ]]; then echo false; else echo true; fi
     ;;
   'release view')
     [[ -d $FAKE_RELEASE ]]
@@ -29,11 +36,6 @@ case "$1 $2" in
       *'--json isDraft'*) if [[ -f $FAKE_RELEASE.published ]]; then echo false; else echo true; fi ;;
       *'--json assets'*) for file in "$FAKE_RELEASE"/*; do basename "$file"; done ;;
     esac
-    ;;
-  'release edit')
-    [[ $* == *'--draft=false'* ]] || { echo "gh shim: unexpected $*" >&2; exit 1; }
-    [[ ${FAKE_EDIT_NOOP:-} == 1 ]] || touch "$FAKE_RELEASE.published"
-    bash -c "${FAKE_AFTER_EDIT:-}"
     ;;
   'release download')
     shift 3
@@ -118,17 +120,18 @@ published() { [[ -f $FAKE_RELEASE.published ]]; }
 published_and_consistent() {
   published && (cd "$FAKE_RELEASE" && [[ $(wc -l < SHA256SUMS) -eq 5 ]] && shasum -a 256 -c SHA256SUMS > /dev/null)
 }
-no_publish_attempt() { ! grep -q '^release edit' "$FAKE_LOG"; }
+no_publish_attempt() { ! grep -q '^api -X PATCH' "$FAKE_LOG"; }
+two_releases() { printf '%s\n' '41 draft=true ci 2026-11-20T00:00:00Z' '42 draft=true ci 2026-11-20T01:00:00Z' > "$FAKE_RELEASE.ids"; }
 
 # CI's tag run: check_no_release before creating the draft.
 rm -rf "$FAKE_RELEASE" "$FAKE_RELEASE.ids"
 expect pass 'tag run: no release for the tag passes' '' check_no_release
 new_release
-expect refuse 'tag run: an existing draft is refused with the way out' 'gh release delete v1.0.0-test' check_no_release
+expect refuse 'tag run: an existing draft is refused with the way out' "gh api -X DELETE repos/$repo/releases/<id>" check_no_release
 touch "$FAKE_RELEASE.published"
 expect refuse 'tag run: a published release is refused' 'bump Cargo.toml and push a new tag' check_no_release
-printf '41\n42\n' > "$FAKE_RELEASE.ids"
-expect refuse 'tag run: two releases are refused' 'already exists' check_no_release
+two_releases
+expect refuse 'tag run: two releases are refused, listing them' '42 draft=true ci' check_no_release
 
 new_release
 expect pass 'fresh draft: add macOS, verify, publish, verify' '' publish_macos one
@@ -158,11 +161,12 @@ expect refuse 'missing SHA256SUMS is refused with recovery steps' 'gh run downlo
 
 new_release
 echo tampered > "$FAKE_RELEASE/git-ai-linux-arm64"
-expect refuse 'tampered CI binary is refused' "CI's binaries on v$version do not match" publish_macos eight
+expect refuse 'tampered CI binary is refused' "Do not regenerate SHA256SUMS" publish_macos eight
 
 new_release
-printf '41\n42\n' > "$FAKE_RELEASE.ids"
-expect refuse 'two releases for the tag are refused' "Found 2 releases for v$version" publish_macos nine
+two_releases
+expect refuse 'two releases for the tag are refused, listing them with the way out' \
+  "gh api -X DELETE repos/$repo/releases/<id>" publish_macos nine
 touch "$FAKE_RELEASE.published"
 expect refuse 'a published release and a draft for the tag are refused' "Found 2 releases for v$version" publish_macos ten
 rm -rf "$FAKE_RELEASE" "$FAKE_RELEASE.ids"
@@ -189,18 +193,37 @@ FAKE_AFTER_UPLOAD='echo 99 > "$FAKE_RELEASE.ids"' \
 if published || ! no_publish_attempt; then fail 'replaced release was published'; fi
 
 new_release
+# Each later gh step checks it still works on the pinned release (check_draft pinned 41 in its
+# own subshell, so pin it here too).
+release_id=41
+for fn in upload_macos verify_draft publish_release verify_published; do
+  new_release
+  expect pass "pinned release ($fn): setup" '' check_draft
+  echo '99 draft=true ci 2026-11-20T02:00:00Z' > "$FAKE_RELEASE.ids"
+  rm -f "$FAKE_LOG"
+  expect refuse "release replaced before $fn: refused" 'changed during this run' "$fn"
+  if grep -q -e '^api -X PATCH' -e '^release upload' -e '^release download' -e '^release view' "$FAKE_LOG"; then
+    fail "$fn touched the release after it changed"
+  fi
+done
+
+new_release
+expect pass 'upload to a published release: setup' '' publish_macos twenty
+expect refuse 'upload to a published release is refused by GitHub' 'immutable release' upload_macos
+
+new_release
 # shellcheck disable=SC2016 # expanded by the shim's shell
 FAKE_AFTER_EDIT='echo tampered > "$FAKE_RELEASE/git-ai-windows-arm64.exe"' \
   expect refuse 'published release that does not match is reported' "Published v$version does not match" publish_macos fourteen
 
 new_release
 grep -v ' git-ai-linux-arm64$' "$FAKE_RELEASE/SHA256SUMS" > "$tmp/sums" && mv "$tmp/sums" "$FAKE_RELEASE/SHA256SUMS"
-expect refuse 'SHA256SUMS with 3 non-macOS lines is refused' "CI's binaries on v$version do not match" publish_macos fifteen
+expect refuse 'SHA256SUMS with 3 non-macOS lines is refused' "Do not regenerate SHA256SUMS" publish_macos fifteen
 
 new_release
 echo 'ci extra' > "$FAKE_RELEASE/git-ai-extra"
 (cd "$FAKE_RELEASE" && shasum -a 256 git-ai-extra >> SHA256SUMS)
-expect refuse 'SHA256SUMS with 5 non-macOS lines is refused' "CI's binaries on v$version do not match" publish_macos sixteen
+expect refuse 'SHA256SUMS with 5 non-macOS lines is refused' "Do not regenerate SHA256SUMS" publish_macos sixteen
 
 # A macOS line that does not match its asset, or whose asset is missing, is replaced by a re-run.
 new_release
@@ -218,7 +241,7 @@ rm -f "$FAKE_LOG"
 dry_run=$(bash "$script" --dry-run)
 lines=()
 for text in 'only release for v' "shasum -a 256 -c CI's four" 'cargo build --release' '(expect 5 lines)' \
-  'gh release upload' 'verify the draft' '--draft=false' 'verify the published release'; do
+  'gh release upload' 'verify the draft' '-F draft=false' 'verify the published release'; do
   lines+=("$(step_line "$text")")
 done
 ordered=true
