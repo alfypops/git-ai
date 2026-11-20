@@ -89,6 +89,8 @@ pub mod trace_normalizer;
 pub mod transcript_redaction;
 pub mod untraced_commit_fixup;
 pub mod untraced_fixup_ignore;
+#[cfg(windows)]
+mod windows_pipe;
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,

@@ -1,7 +1,7 @@
 # Linux and Windows release builds for this fork, ported from upstream's release.yml
 # build matrix and test.yml unix-core row. Pull requests and manual runs build the
 # binaries and SHA256SUMS without publishing; pull requests also run the unix-core
-# tests, the Windows home-from-environment lib tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also creates
+# tests, the Windows home-from-environment and daemon pipe lib tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also creates
 # the GitHub release as a draft; the tag must be on cs/v1.7.5 (merge first). A manual run on
 # cs/v1.7.5 runs the tag and branch checks against v<Cargo.toml version> before the tag
 # is pushed; there an existing release only warns. Published releases are immutable, so
@@ -372,7 +372,7 @@ jobs:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
 
   windows-home-env:
-    name: Test home from environment (Windows)
+    name: Test home from environment and daemon pipes (Windows)
     if: github.event_name == 'pull_request'
     runs-on: windows-2025
     timeout-minutes: 60
@@ -398,13 +398,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
-      - name: Run home-from-environment tests
+      - name: Run home-from-environment and daemon pipe tests
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --lib follows_home_env 2>&1 | tee test-output.txt
-          grep -q 'test result: ok. 5 passed' test-output.txt || {
-            echo "::error::Expected 'test result: ok. 5 passed'"
+          cargo test --locked --lib -- follows_home_env windows_pipe_tests 2>&1 | tee test-output.txt
+          grep -q 'test result: ok. 13 passed' test-output.txt || {
+            echo "::error::Expected 'test result: ok. 13 passed'"
             exit 1
           }
         env:
