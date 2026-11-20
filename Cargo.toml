@@ -2,7 +2,7 @@
 # Modified by alfypops, 2026: gix-path dependency.
 [package]
 name = "git-ai"
-version = "1.7.5-cs.6"
+version = "1.7.5-cs.7"
 edition = "2024"
 default-run = "git-ai"
 
