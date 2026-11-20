@@ -845,6 +845,21 @@ mod windows_pipe_tests {
     }
 
     #[test]
+    fn an_inherit_only_low_label_does_not_refuse_the_pipe() {
+        let path = unique_pipe_path("inherit-only-label");
+        let user_sid = current_user()
+            .expect("current user")
+            .sid_string()
+            .expect("sid string");
+        let security = InstanceSecurity::from_sddl(&format!(
+            "O:{user_sid}D:P(A;;GA;;;{user_sid})S:(ML;IO;NW;;;LW)"
+        ))
+        .expect("descriptor");
+        let _instance = create_instance(&path, true, &security).expect("create_instance");
+        connect(&path, CONNECT_TIMEOUT).expect("an inherit-only label does not apply to the pipe");
+    }
+
+    #[test]
     fn a_pipe_labelled_below_medium_integrity_is_refused() {
         let path = unique_pipe_path("low-integrity");
         let user_sid = current_user()
