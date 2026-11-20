@@ -1,11 +1,12 @@
 # Linux and Windows release builds for this fork, ported from upstream's release.yml
 # build matrix and test.yml unix-core row. Pull requests and manual runs build the
 # binaries and SHA256SUMS without publishing; pull requests also run the unix-core
-# tests, the Windows home-from-environment lib tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also publishes
-# the GitHub release; the tag must be on cs/v1.7.5 (merge first). A manual run on
+# tests, the Windows home-from-environment lib tests and scripts/tests/cs-release-test.sh. A pushed v1.7.5-cs.* tag also creates
+# the GitHub release as a draft; the tag must be on cs/v1.7.5 (merge first). A manual run on
 # cs/v1.7.5 runs the tag and branch checks against v<Cargo.toml version> before the tag
-# is pushed; there an existing release only warns. The macOS binary is built, signed and added to that release locally by
-# scripts/cs-release.sh. Builds get no secrets and no telemetry keys.
+# is pushed; there an existing release only warns. Published releases are immutable, so
+# scripts/cs-release.sh builds and signs the macOS binary locally, adds it and the 5-line SHA256SUMS
+# to the draft, verifies every asset, then publishes. Builds get no secrets and no telemetry keys.
 name: CS Release
 
 permissions:
@@ -64,7 +65,7 @@ jobs:
           fi
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             if [[ $GITHUB_EVENT_NAME == push ]]; then
-              echo "::error::Release $TAG already exists; refusing to overwrite its assets. If an earlier run left it partial or failed, run gh release delete $TAG and re-run."
+              echo "::error::Release $TAG is already published and immutable; bump Cargo.toml and push a new tag."
               exit 1
             fi
             echo "::warning::Release $TAG already exists; bump Cargo.toml before the next tag"
@@ -262,9 +263,9 @@ jobs:
           done
 
   publish:
-    name: Publish release
+    name: Create draft release
     if: github.event_name == 'push'
-    needs: assemble
+    needs: [version, assemble]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -280,13 +281,21 @@ jobs:
           merge-multiple: true
           path: release
 
-      - name: Create release
+      # The version job's read-only token cannot see drafts, so check for one here: GitHub
+      # allows several drafts per tag, and cs-release.sh needs exactly one.
+      - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
+          set -euo pipefail
+          repo=$GITHUB_REPOSITORY version=$VERSION
+          # shellcheck source=scripts/cs-release.sh
+          . scripts/cs-release.sh
+          check_no_release
           gh release create "$TAG" release/git-ai-* release/SHA256SUMS LICENSE \
-            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
             --title "alfypops build of git-ai $TAG" \
             --notes-file cs-release-notes.md
 
