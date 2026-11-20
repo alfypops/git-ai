@@ -37,12 +37,6 @@ use interprocess::{
     ConnectWaitMode,
     local_socket::{GenericFilePath, ListenerOptions, Name, prelude::*},
 };
-#[cfg(windows)]
-use named_pipe::{
-    ConnectingServer as WindowsConnectingServer, OpenMode as WindowsPipeOpenMode,
-    PipeClient as WindowsPipeClient, PipeOptions as WindowsPipeOptions,
-    PipeServer as WindowsPipeServer,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -89,6 +83,8 @@ pub mod trace_normalizer;
 pub mod transcript_redaction;
 pub mod untraced_commit_fixup;
 pub mod untraced_fixup_ignore;
+#[cfg(windows)]
+mod windows_pipe;
 
 pub use control_api::{
     BashSessionQueryResponse, BashSnapshotQueryResponse, ControlRequest, ControlResponse,
@@ -291,7 +287,7 @@ pub type DaemonClientStream = LocalSocketStream;
 
 #[cfg(windows)]
 pub enum DaemonClientStream {
-    WindowsPipe(WindowsPipeClient),
+    WindowsPipe(windows_pipe::OverlappedPipe),
 }
 
 #[cfg(windows)]
@@ -9054,72 +9050,29 @@ fn control_listener_loop_actor(
 
     #[cfg(windows)]
     {
-        let mut workers = Vec::new();
-        let worker_count = windows_control_pipe_worker_count();
-        let first_connecting = windows_pipe_connecting_server(&control_socket_path, true)?;
-        {
-            let path = control_socket_path.clone();
-            let coord = coordinator.clone();
-            let handle = runtime_handle.clone();
-            workers.push(std::thread::spawn(move || {
-                let result =
-                    windows_control_pipe_worker_loop(path, first_connecting, coord.clone(), handle);
-                if let Err(error) = &result {
-                    tracing::error!(%error, "control worker error");
-                    coord.request_shutdown();
-                }
-                result
-            }));
-        }
-        for _ in 1..worker_count {
-            let path = control_socket_path.clone();
-            let coord = coordinator.clone();
-            let handle = runtime_handle.clone();
-            let connecting = windows_pipe_connecting_server(&path, false)?;
-            workers.push(std::thread::spawn(move || {
-                let result =
-                    windows_control_pipe_worker_loop(path, connecting, coord.clone(), handle);
-                if let Err(error) = &result {
-                    tracing::error!(%error, "control worker error");
-                    coord.request_shutdown();
-                }
-                result
-            }));
-        }
-
-        while !coordinator.is_shutting_down() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        wake_windows_pipe_workers(&control_socket_path, worker_count);
-
-        for worker in workers {
-            let result = worker
-                .join()
-                .map_err(|_| GitAiError::Generic("daemon control worker panicked".to_string()))?;
-            result?;
-        }
-
-        Ok(())
+        let is_shutting_down = {
+            let coordinator = coordinator.clone();
+            move || coordinator.is_shutting_down()
+        };
+        let on_worker_error = {
+            let coordinator = coordinator.clone();
+            move || coordinator.request_shutdown()
+        };
+        windows_pipe::serve_pipe_workers(
+            "control",
+            &control_socket_path,
+            windows_control_pipe_worker_count(),
+            is_shutting_down,
+            on_worker_error,
+            move |pipe| {
+                handle_windows_control_pipe_connection(
+                    pipe,
+                    coordinator.clone(),
+                    runtime_handle.clone(),
+                )
+            },
+        )
     }
-}
-
-#[cfg(windows)]
-fn windows_pipe_connecting_server(
-    pipe_path: &Path,
-    first_instance: bool,
-) -> Result<WindowsConnectingServer, GitAiError> {
-    let mut options = WindowsPipeOptions::new(pipe_path.as_os_str());
-    options
-        .first(first_instance)
-        .open_mode(WindowsPipeOpenMode::Duplex);
-    options.single().map_err(|e| {
-        GitAiError::Generic(format!(
-            "failed binding windows daemon pipe {}: {}",
-            pipe_path.display(),
-            e
-        ))
-    })
 }
 
 #[cfg(windows)]
@@ -9149,56 +9102,8 @@ fn windows_control_pipe_worker_count() -> usize {
 }
 
 #[cfg(windows)]
-fn wake_windows_pipe_workers(pipe_path: &Path, worker_count: usize) {
-    for _ in 0..worker_count {
-        let _ = WindowsPipeClient::connect_ms(pipe_path.as_os_str(), 100);
-    }
-}
-
-#[cfg(windows)]
-fn windows_control_pipe_worker_loop(
-    control_socket_path: PathBuf,
-    mut connecting: WindowsConnectingServer,
-    coordinator: Arc<ActorDaemonCoordinator>,
-    runtime_handle: tokio::runtime::Handle,
-) -> Result<(), GitAiError> {
-    loop {
-        let server = connecting.wait().map_err(|e| {
-            GitAiError::Generic(format!(
-                "failed accepting control pipe {}: {}",
-                control_socket_path.display(),
-                e
-            ))
-        })?;
-
-        if coordinator.is_shutting_down() {
-            let _ = server.disconnect();
-            break;
-        }
-
-        connecting = windows_pipe_connecting_server(&control_socket_path, false)?;
-
-        let coord = coordinator.clone();
-        let handle = runtime_handle.clone();
-        std::thread::Builder::new()
-            .spawn(move || {
-                handle_windows_control_pipe_connection(server, coord, handle);
-            })
-            .map_err(|e| {
-                GitAiError::Generic(format!(
-                    "failed spawning control pipe handler for {}: {}",
-                    control_socket_path.display(),
-                    e
-                ))
-            })?;
-    }
-
-    Ok(())
-}
-
-#[cfg(windows)]
 fn handle_windows_control_pipe_connection(
-    server: WindowsPipeServer,
+    server: windows_pipe::OverlappedPipe,
     coordinator: Arc<ActorDaemonCoordinator>,
     runtime_handle: tokio::runtime::Handle,
 ) {
@@ -9214,7 +9119,7 @@ trait ControlConnection: Read + Write {
 }
 
 #[cfg(windows)]
-impl ControlConnection for WindowsPipeServer {
+impl ControlConnection for windows_pipe::OverlappedPipe {
     fn set_receive_timeout(&mut self, timeout: Option<Duration>) -> Result<(), GitAiError> {
         self.set_read_timeout(timeout);
         Ok(())
@@ -9683,94 +9588,28 @@ fn trace_listener_loop_actor(
 
     #[cfg(windows)]
     {
-        let mut workers = Vec::new();
-        let worker_count = windows_trace_pipe_worker_count();
-        let first_connecting = windows_pipe_connecting_server(&trace_socket_path, true)?;
-        {
-            let path = trace_socket_path.clone();
-            let coord = coordinator.clone();
-            workers.push(std::thread::spawn(move || {
-                let result = windows_trace_pipe_worker_loop(path, first_connecting, coord.clone());
-                if let Err(error) = &result {
-                    tracing::error!(%error, "trace worker error");
-                    coord.request_shutdown();
-                }
-                result
-            }));
-        }
-        for _ in 1..worker_count {
-            let path = trace_socket_path.clone();
-            let coord = coordinator.clone();
-            let connecting = windows_pipe_connecting_server(&path, false)?;
-            workers.push(std::thread::spawn(move || {
-                let result = windows_trace_pipe_worker_loop(path, connecting, coord.clone());
-                if let Err(error) = &result {
-                    tracing::error!(%error, "trace worker error");
-                    coord.request_shutdown();
-                }
-                result
-            }));
-        }
-
-        while !coordinator.is_shutting_down() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        wake_windows_pipe_workers(&trace_socket_path, worker_count);
-
-        for worker in workers {
-            let result = worker
-                .join()
-                .map_err(|_| GitAiError::Generic("daemon trace worker panicked".to_string()))?;
-            result?;
-        }
-
-        Ok(())
+        let is_shutting_down = {
+            let coordinator = coordinator.clone();
+            move || coordinator.is_shutting_down()
+        };
+        let on_worker_error = {
+            let coordinator = coordinator.clone();
+            move || coordinator.request_shutdown()
+        };
+        windows_pipe::serve_pipe_workers(
+            "trace",
+            &trace_socket_path,
+            windows_trace_pipe_worker_count(),
+            is_shutting_down,
+            on_worker_error,
+            move |pipe| handle_windows_trace_pipe_connection(pipe, coordinator.clone()),
+        )
     }
-}
-
-#[cfg(windows)]
-fn windows_trace_pipe_worker_loop(
-    trace_socket_path: PathBuf,
-    mut connecting: WindowsConnectingServer,
-    coordinator: Arc<ActorDaemonCoordinator>,
-) -> Result<(), GitAiError> {
-    loop {
-        let server = connecting.wait().map_err(|e| {
-            GitAiError::Generic(format!(
-                "failed accepting trace pipe {}: {}",
-                trace_socket_path.display(),
-                e
-            ))
-        })?;
-
-        if coordinator.is_shutting_down() {
-            let _ = server.disconnect();
-            break;
-        }
-
-        connecting = windows_pipe_connecting_server(&trace_socket_path, false)?;
-
-        let coord = coordinator.clone();
-        std::thread::Builder::new()
-            .spawn(move || {
-                handle_windows_trace_pipe_connection(server, coord);
-            })
-            .map_err(|e| {
-                GitAiError::Generic(format!(
-                    "failed spawning trace pipe handler for {}: {}",
-                    trace_socket_path.display(),
-                    e
-                ))
-            })?;
-    }
-
-    Ok(())
 }
 
 #[cfg(windows)]
 fn handle_windows_trace_pipe_connection(
-    mut server: WindowsPipeServer,
+    mut server: windows_pipe::OverlappedPipe,
     coordinator: Arc<ActorDaemonCoordinator>,
 ) {
     if let Err(e) = coordinator.trace_unidentified_connection_opened() {
@@ -11470,7 +11309,7 @@ pub fn open_local_socket_stream_with_timeout(
 ) -> Result<DaemonClientStream, GitAiError> {
     #[cfg(windows)]
     {
-        let stream = open_windows_named_pipe_client_with_timeout(socket_path, timeout)?;
+        let stream = windows_pipe::connect(socket_path, timeout)?;
         Ok(DaemonClientStream::WindowsPipe(stream))
     }
 
@@ -11489,22 +11328,6 @@ pub fn open_local_socket_stream_with_timeout(
                 ))
             })
     }
-}
-
-#[cfg(windows)]
-fn open_windows_named_pipe_client_with_timeout(
-    socket_path: &Path,
-    timeout: Duration,
-) -> Result<WindowsPipeClient, GitAiError> {
-    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-    WindowsPipeClient::connect_ms(socket_path.as_os_str(), timeout_ms).map_err(|e| {
-        GitAiError::Generic(format!(
-            "timed out after {:?} connecting daemon socket {}: {}",
-            timeout,
-            socket_path.display(),
-            e
-        ))
-    })
 }
 
 fn set_daemon_client_stream_timeouts(

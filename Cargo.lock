@@ -1091,7 +1091,6 @@ dependencies = [
  "keyring",
  "libc",
  "mockito",
- "named_pipe",
  "once_cell",
  "openssl",
  "paste",
@@ -2225,15 +2224,6 @@ dependencies = [
  "serde_urlencoded",
  "similar",
  "tokio",
-]
-
-[[package]]
-name = "named_pipe"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad9c443cce91fc3e12f017290db75dde490d685cdaaf508d7159d7cf41f0eb2b"
-dependencies = [
- "winapi",
 ]
 
 [[package]]
