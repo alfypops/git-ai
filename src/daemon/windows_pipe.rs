@@ -25,8 +25,11 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, EqualSid, GetAce, GetAclInformation,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SYSTEM_MANDATORY_LABEL_ACE, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TOKEN_USER, TokenIntegrityLevel, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_FLAGS_AND_ATTRIBUTES,
@@ -48,6 +51,10 @@ const OPEN_MODE: FILE_FLAGS_AND_ATTRIBUTES = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVER
 pub(crate) const PIPE_MODE: NAMED_PIPE_MODE =
     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
 const PIPE_BUFFER_BYTES: u32 = 65536;
+/// `SECURITY_MANDATORY_MEDIUM_RID`: the integrity level of an unlabelled object.
+const MEDIUM_INTEGRITY_RID: u32 = 0x2000;
+/// `SYSTEM_MANDATORY_LABEL_ACE_TYPE`.
+const MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
 /// How long the shutdown wake waits to reach each worker.
 const WAKE_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -69,10 +76,11 @@ impl Drop for LocalBox {
     }
 }
 
-/// The process token's `TOKEN_USER`, read once.
+/// The process token's user and integrity level, read once.
 pub(crate) struct CurrentUser {
     // u64 words keep the TOKEN_USER header aligned.
     token_user: Vec<u64>,
+    integrity_rid: u32,
 }
 
 impl CurrentUser {
@@ -103,22 +111,90 @@ pub(crate) fn current_user() -> io::Result<&'static CurrentUser> {
         return Err(io::Error::last_os_error());
     }
     let token = Handle(token);
+    let token_user = token_information(&token, TokenUser)?;
+    let label = token_information(&token, TokenIntegrityLevel)?;
+    let integrity_rid = integrity_rid(unsafe {
+        (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL))
+            .Label
+            .Sid
+    });
+    Ok(CURRENT_USER.get_or_init(|| CurrentUser {
+        token_user,
+        integrity_rid,
+    }))
+}
+
+fn token_information(token: &Handle, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<u64>> {
     let mut needed = 0u32;
-    unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
-    let mut token_user = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+    unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut needed) };
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
     if unsafe {
         GetTokenInformation(
             token.0,
-            TokenUser,
-            token_user.as_mut_ptr() as *mut _,
-            (token_user.len() * 8) as u32,
+            class,
+            buffer.as_mut_ptr() as *mut core::ffi::c_void,
+            (buffer.len() * 8) as u32,
             &mut needed,
         )
     } == 0
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(CURRENT_USER.get_or_init(|| CurrentUser { token_user }))
+    Ok(buffer)
+}
+
+/// The level of an integrity SID (`S-1-16-<rid>`): its last sub-authority.
+fn integrity_rid(sid: PSID) -> u32 {
+    unsafe {
+        let count = u32::from(*GetSidSubAuthorityCount(sid));
+        *GetSidSubAuthority(sid, count.saturating_sub(1))
+    }
+}
+
+/// The ACEs of an ACL, in order; empty for a NULL ACL.
+fn acl_aces(acl: *const ACL) -> io::Result<Vec<*const ACE_HEADER>> {
+    if acl.is_null() {
+        return Ok(Vec::new());
+    }
+    let mut size = ACL_SIZE_INFORMATION {
+        AceCount: 0,
+        AclBytesInUse: 0,
+        AclBytesFree: 0,
+    };
+    if unsafe {
+        GetAclInformation(
+            acl,
+            &mut size as *mut ACL_SIZE_INFORMATION as *mut core::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    (0..size.AceCount)
+        .map(|index| {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(ace as *const ACE_HEADER)
+        })
+        .collect()
+}
+
+/// The integrity level a SACL's mandatory label gives its object; an
+/// unlabelled object is medium.
+fn label_integrity_rid(sacl: *const ACL) -> io::Result<u32> {
+    for ace in acl_aces(sacl)? {
+        if unsafe { (*ace).AceType } == MANDATORY_LABEL_ACE_TYPE {
+            let ace = ace as *const SYSTEM_MANDATORY_LABEL_ACE;
+            return Ok(integrity_rid(
+                unsafe { &(*ace).SidStart } as *const u32 as PSID
+            ));
+        }
+    }
+    Ok(MEDIUM_INTEGRITY_RID)
 }
 
 /// Closes a kernel handle on drop.
@@ -142,9 +218,21 @@ impl InstanceSecurity {
     }
 
     /// `owner_sid` is a SID string; anything but the current user is for tests.
+    /// Above medium integrity (an elevated daemon) the instances are labelled at
+    /// the daemon's level, so the user's unelevated processes cannot use them.
     pub(crate) fn owned_by(owner_sid: &str) -> io::Result<Self> {
-        let user_sid = current_user()?.sid_string()?;
-        let sddl = wide_nul(format!("O:{owner_sid}D:P(A;;GA;;;{user_sid})").as_ref());
+        let user = current_user()?;
+        let user_sid = user.sid_string()?;
+        let label = if user.integrity_rid > MEDIUM_INTEGRITY_RID {
+            format!("S:(ML;;NWNR;;;S-1-16-{})", user.integrity_rid)
+        } else {
+            String::new()
+        };
+        Self::from_sddl(&format!("O:{owner_sid}D:P(A;;GA;;;{user_sid}){label}"))
+    }
+
+    fn from_sddl(sddl: &str) -> io::Result<Self> {
+        let sddl = wide_nul(sddl.as_ref());
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -373,10 +461,11 @@ pub(crate) fn connect(path: &Path, timeout: Duration) -> Result<OverlappedPipe, 
         }
     };
     let pipe = OverlappedPipe::new(file.into_raw_handle() as HANDLE).map_err(connect_error)?;
-    if !pipe.owned_by_current_user().map_err(connect_error)? {
+    if let Some(reason) = pipe.refusal().map_err(connect_error)? {
         return Err(GitAiError::Generic(format!(
-            "refusing daemon pipe {}: another user owns the pipe",
-            path.display()
+            "refusing daemon pipe {}: {}",
+            path.display(),
+            reason
         )));
     }
     Ok(pipe)
@@ -458,18 +547,21 @@ impl OverlappedPipe {
         }
     }
 
-    fn owned_by_current_user(&self) -> io::Result<bool> {
+    /// Why a client must not use this pipe: another account owns it, or its
+    /// integrity label is below medium. `None` when it is the user's own.
+    fn refusal(&self) -> io::Result<Option<&'static str>> {
         let mut owner: PSID = std::ptr::null_mut();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         let status = unsafe {
             GetSecurityInfo(
                 self.handle,
                 SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
                 &mut owner,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut sacl,
                 &mut descriptor,
             )
         };
@@ -477,7 +569,13 @@ impl OverlappedPipe {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _free = LocalBox(descriptor);
-        Ok(unsafe { EqualSid(owner, current_user()?.sid()) } != 0)
+        if unsafe { EqualSid(owner, current_user()?.sid()) } == 0 {
+            return Ok(Some("another user owns the pipe"));
+        }
+        if label_integrity_rid(sacl)? < MEDIUM_INTEGRITY_RID {
+            return Ok(Some("the pipe is labelled below medium integrity"));
+        }
+        Ok(None)
     }
 
     /// Starts one overlapped operation and waits up to `timeout` for it. On
@@ -570,13 +668,9 @@ mod windows_pipe_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Foundation::{ERROR_INVALID_OWNER, HANDLE, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-        GetSecurityDescriptorControl, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_DACL_PROTECTED, SecurityIdentification,
-        TOKEN_QUERY, TokenImpersonationLevel,
+        ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, RevertToSelf,
+        SE_DACL_PROTECTED, SecurityIdentification, TokenImpersonationLevel,
     };
     use windows_sys::Win32::System::Pipes::{
         ImpersonateNamedPipeClient, PIPE_REJECT_REMOTE_CLIENTS,
@@ -614,27 +708,29 @@ mod windows_pipe_tests {
         }
     }
 
-    /// The owner, DACL protection and allow ACEs of a pipe handle.
+    /// The owner, DACL, and integrity label of a pipe handle.
     struct PipeSecurity {
         owner_is_current_user: bool,
         dacl_protected: bool,
         allow_ace_sids_are_current_user: Vec<bool>,
-        ace_count: u32,
+        ace_count: usize,
+        label_rid: u32,
     }
 
     fn read_pipe_security(handle: HANDLE) -> PipeSecurity {
         let mut owner: PSID = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sacl: *mut ACL = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         let status = unsafe {
             GetSecurityInfo(
                 handle,
                 SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION,
                 &mut owner,
                 std::ptr::null_mut(),
                 &mut dacl,
-                std::ptr::null_mut(),
+                &mut sacl,
                 &mut descriptor,
             )
         };
@@ -652,38 +748,23 @@ mod windows_pipe_tests {
             !dacl.is_null(),
             "the pipe has a NULL DACL (everyone allowed)"
         );
-        let mut size = ACL_SIZE_INFORMATION {
-            AceCount: 0,
-            AclBytesInUse: 0,
-            AclBytesFree: 0,
-        };
-        assert_ne!(
-            unsafe {
-                GetAclInformation(
-                    dacl,
-                    &mut size as *mut ACL_SIZE_INFORMATION as *mut core::ffi::c_void,
-                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                    AclSizeInformation,
-                )
-            },
-            0
-        );
-        let mut allow_ace_sids_are_current_user = Vec::new();
-        for index in 0..size.AceCount {
-            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
-            let ace = ace as *const ACCESS_ALLOWED_ACE;
-            if unsafe { (*ace).Header.AceType } == ACCESS_ALLOWED_ACE_TYPE {
+        let aces = acl_aces(dacl).expect("DACL ACEs");
+        let allow_ace_sids_are_current_user = aces
+            .iter()
+            .filter(|&&ace| unsafe { (*ace).AceType } == ACCESS_ALLOWED_ACE_TYPE)
+            .map(|&ace| {
+                let ace = ace as *const ACCESS_ALLOWED_ACE;
                 let sid = unsafe { &(*ace).SidStart } as *const u32 as PSID;
-                allow_ace_sids_are_current_user.push(unsafe { EqualSid(sid, user) } != 0);
-            }
-        }
+                (unsafe { EqualSid(sid, user) }) != 0
+            })
+            .collect();
 
         let security = PipeSecurity {
             owner_is_current_user: unsafe { EqualSid(owner, user) } != 0,
             dacl_protected: control & SE_DACL_PROTECTED != 0,
             allow_ace_sids_are_current_user,
-            ace_count: size.AceCount,
+            ace_count: aces.len(),
+            label_rid: label_integrity_rid(sacl).expect("label"),
         };
         unsafe { LocalFree(descriptor) };
         security
@@ -751,6 +832,34 @@ mod windows_pipe_tests {
         assert!(recreated.dacl_protected, "the DACL is not protected");
         assert_eq!(recreated.ace_count, 1, "expected exactly one ACE");
         assert_eq!(recreated.allow_ace_sids_are_current_user, vec![true]);
+        // An elevated daemon (as on CI) labels its instances at its own level.
+        let daemon_rid = current_user().expect("current user").integrity_rid;
+        assert_eq!(
+            recreated.label_rid,
+            daemon_rid.max(MEDIUM_INTEGRITY_RID),
+            "the instance is not labelled at the daemon's integrity level"
+        );
+    }
+
+    #[test]
+    fn a_pipe_labelled_below_medium_integrity_is_refused() {
+        let path = unique_pipe_path("low-integrity");
+        let user_sid = current_user()
+            .expect("current user")
+            .sid_string()
+            .expect("sid string");
+        let security = InstanceSecurity::from_sddl(&format!(
+            "O:{user_sid}D:P(A;;GA;;;{user_sid})S:(ML;;NW;;;LW)"
+        ))
+        .expect("descriptor");
+        let _instance = create_instance(&path, true, &security).expect("create_instance");
+        let error = connect(&path, CONNECT_TIMEOUT)
+            .err()
+            .expect("the client must refuse a low-integrity pipe");
+        assert!(
+            error.to_string().contains("below medium integrity"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

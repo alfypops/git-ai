@@ -403,8 +403,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --locked --lib -- follows_home_env windows_pipe_tests 2>&1 | tee test-output.txt
-          grep -q 'test result: ok. 13 passed' test-output.txt || {
-            echo "::error::Expected 'test result: ok. 13 passed'"
+          grep -q 'test result: ok. 14 passed' test-output.txt || {
+            echo "::error::Expected 'test result: ok. 14 passed'"
             exit 1
           }
         env:
